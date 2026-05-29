@@ -287,6 +287,16 @@ def _attachment_paths_from_req(req: dict[str, Any]) -> list[str]:
     return out
 
 
+def _history_for_chat(req: dict[str, Any]) -> list:
+    """Drop prior turns when starting fresh — old chat must not reach the model."""
+    if req.get("fresh_session"):
+        return []
+    history = req.get("history") or []
+    if not isinstance(history, list):
+        return []
+    return history
+
+
 def _handle(req: dict[str, Any]) -> None:
     action = req.get("action")
     if not action:
@@ -531,7 +541,7 @@ def _handle(req: dict[str, Any]) -> None:
                 "Answer using the attached file(s). Summarize key points "
                 "and be ready for follow-up questions."
             )
-        history = req.get("history") or []
+        history = _history_for_chat(req)
         auto_learn = bool(req.get("auto_learn", True))
         use_internet = bool(req.get("use_internet", False))
         from assistant import normalize_chat_provider
@@ -600,7 +610,7 @@ def _handle(req: dict[str, Any]) -> None:
                 "Answer using the attached file(s). Summarize key points "
                 "and be ready for follow-up questions."
             )
-        history = req.get("history") or []
+        history = _history_for_chat(req)
         auto_learn = bool(req.get("auto_learn", True))
         use_internet = bool(req.get("use_internet", False))
         from assistant import normalize_chat_provider
@@ -707,6 +717,13 @@ def _handle(req: dict[str, Any]) -> None:
         if not password:
             _err("Owner password required")
         msg, result = forget_all_trained(owner_password=password)
+        _ok({"message": msg, **result})
+        return
+
+    if action == "clear_chat_session":
+        from assistant import clear_chat_session
+
+        msg, result = clear_chat_session()
         _ok({"message": msg, **result})
         return
 

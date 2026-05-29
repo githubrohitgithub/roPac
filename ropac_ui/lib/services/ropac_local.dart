@@ -169,6 +169,7 @@ class RopacLocal {
     String message, {
     List<ChatMessage> history = const [],
     bool autoLearn = true,
+    bool freshSession = false,
     String chatProvider = 'local',
     String? openaiApiKey,
     String? ownerPassword,
@@ -180,6 +181,9 @@ class RopacLocal {
       'auto_learn': autoLearn,
       'chat_provider': chatProvider,
     };
+    if (freshSession) {
+      payload['fresh_session'] = true;
+    }
     if (openaiApiKey != null && openaiApiKey.isNotEmpty) {
       payload['openai_api_key'] = openaiApiKey;
     }
@@ -207,6 +211,7 @@ class RopacLocal {
     String message, {
     List<ChatMessage> history = const [],
     bool autoLearn = true,
+    bool freshSession = false,
     String chatProvider = 'local',
     String? openaiApiKey,
     String? ownerPassword,
@@ -229,6 +234,9 @@ class RopacLocal {
       'auto_learn': autoLearn,
       'chat_provider': chatProvider,
     };
+    if (freshSession) {
+      payload['fresh_session'] = true;
+    }
     if (openaiApiKey != null && openaiApiKey.isNotEmpty) {
       payload['openai_api_key'] = openaiApiKey;
     }
@@ -407,6 +415,12 @@ class RopacLocal {
       'password': ownerPassword,
     });
     return data['message'] as String? ?? 'Forgot trained files';
+  }
+
+  /// Clear on-screen conversation context, chat log, and attachment cache.
+  Future<String> clearChatSession() async {
+    final data = await _invoke({'action': 'clear_chat_session'});
+    return data['message'] as String? ?? 'Chat cleared';
   }
 
   /// Wipe memory, RAG, embeddings, sessions, and chat history.

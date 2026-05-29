@@ -691,6 +691,34 @@ def append_history(role: str, content: str) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def clear_chat_session() -> tuple[str, dict[str, Any]]:
+    """Clear chat log and attachment session cache for a fresh conversation."""
+    from knowledge import KNOWLEDGE_DIR
+
+    history_cleared = False
+    if HISTORY_PATH.exists():
+        HISTORY_PATH.write_text("", encoding="utf-8")
+        history_cleared = True
+
+    sessions_dir = KNOWLEDGE_DIR / "sessions"
+    sessions_removed = 0
+    if sessions_dir.is_dir():
+        for path in sessions_dir.glob("*.json"):
+            path.unlink()
+            sessions_removed += 1
+
+    msg = (
+        "Chat cleared — start fresh.\n"
+        f"  History log: {'cleared' if history_cleared else 'empty'}\n"
+        f"  Attachment cache removed: {sessions_removed}"
+    )
+    return msg, {
+        "ok": True,
+        "chat_history_cleared": history_cleared,
+        "sessions_removed": sessions_removed,
+    }
+
+
 def _parse_facts_json(text: str) -> list[str]:
     text = text.strip()
     if not text:

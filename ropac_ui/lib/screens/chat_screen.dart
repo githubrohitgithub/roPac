@@ -100,6 +100,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final _openAiKeyController = TextEditingController();
   bool _loading = false;
   bool _waitingForStream = false;
+  bool _freshSession = false;
   final List<_PendingAttachment> _attachments = [];
 
   @override
@@ -423,9 +424,94 @@ class _ChatScreenState extends State<ChatScreen> {
     await _replySpeech?.stopAll();
     await widget.ropac.interruptGeneration();
     if (!mounted) return;
-    setState(() => _loading = false);
+    setState(() {
+      _loading = false;
+      _waitingForStream = false;
+    });
     _scrollToEnd();
     _focusInputIfAllowed();
+  }
+
+  Future<void> _clearChatSession() async {
+    if (_micSession) return;
+    if (_loading) {
+      await _stopGeneration();
+      if (!mounted) return;
+    }
+
+    if (_messages.isNotEmpty) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: RoPacColors.surfaceHigh,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
+          title: const Text(
+            'Start fresh?',
+            style: TextStyle(color: RoPacColors.textPrimary),
+          ),
+          content: const Text(
+            'Clears this chat so old messages are not sent to the model. '
+            'Saved memory and trained files are kept.',
+            style: TextStyle(color: RoPacColors.textMuted, height: 1.35),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Clear chat'),
+            ),
+          ],
+        ),
+      );
+      if (ok != true || !mounted) return;
+    }
+
+    try {
+      await widget.ropac.clearChatSession();
+    } on RopacException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text(e.message),
+        ),
+      );
+      return;
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text(e.toString()),
+        ),
+      );
+      return;
+    }
+
+    await _voice?.stopAll();
+    await _replySpeech?.stopAll();
+    if (!mounted) return;
+    setState(() {
+      _messages.clear();
+      _attachments.clear();
+      _loading = false;
+      _waitingForStream = false;
+      _freshSession = true;
+      _input.clear();
+    });
+    _focusInputIfAllowed();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text('Chat cleared — start fresh'),
+      ),
+    );
   }
 
   Future<void> _editLastUserMessage() async {
@@ -587,15 +673,19 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToEnd();
 
     final assistantIdx = _messages.length - 1;
+    final freshSession = _freshSession;
 
     try {
-      final history = _messages.length > 2
-          ? _messages.sublist(0, _messages.length - 2)
-          : <ChatMessage>[];
+      final history = freshSession
+          ? const <ChatMessage>[]
+          : (_messages.length > 2
+              ? _messages.sublist(0, _messages.length - 2)
+              : <ChatMessage>[]);
 
       var result = await widget.ropac.chatStreaming(
         sendText,
         history: history,
+        freshSession: freshSession,
         chatProvider: _chatProvider.id,
         openaiApiKey: _openAiKeyForRequest,
         attachmentPaths: attachmentPaths,
@@ -633,6 +723,7 @@ class _ChatScreenState extends State<ChatScreen> {
         result = await widget.ropac.chatStreaming(
           sendText,
           history: history,
+          freshSession: freshSession,
           chatProvider: _chatProvider.id,
           openaiApiKey: _openAiKeyForRequest,
           attachmentPaths: attachmentPaths,
@@ -665,6 +756,7 @@ class _ChatScreenState extends State<ChatScreen> {
         );
         _loading = false;
         _waitingForStream = false;
+        _freshSession = false;
       });
       _scrollToEnd();
       final wantSpeak = _speakAloud ||
@@ -700,12 +792,15 @@ class _ChatScreenState extends State<ChatScreen> {
       if (e.message.startsWith('VAULT_LOCKED:') &&
           await _ensureVaultUnlockedForSession()) {
         try {
-          final history = _messages.length > 2
-              ? _messages.sublist(0, _messages.length - 2)
-              : <ChatMessage>[];
+          final retryHistory = freshSession
+              ? const <ChatMessage>[]
+              : (_messages.length > 2
+                  ? _messages.sublist(0, _messages.length - 2)
+                  : <ChatMessage>[]);
           final result = await widget.ropac.chatStreaming(
             sendText,
-            history: history,
+            history: retryHistory,
+            freshSession: freshSession,
             chatProvider: _chatProvider.id,
             openaiApiKey: _openAiKeyForRequest,
             attachmentPaths: attachmentPaths,
@@ -735,6 +830,7 @@ class _ChatScreenState extends State<ChatScreen> {
             );
             _loading = false;
             _waitingForStream = false;
+            _freshSession = false;
           });
           _scrollToEnd();
         } on RopacException catch (retryErr) {
@@ -941,6 +1037,7 @@ class _ChatScreenState extends State<ChatScreen> {
               showRemoveKey: _hasActiveCloudKey,
               onProviderChanged: _setChatProvider,
               onRemoveApiKey: _clearSessionApiKeys,
+              onClearChat: _clearChatSession,
             ),
           ),
           _ChatInput(
@@ -968,6 +1065,7 @@ class _ChatModelSelector extends StatelessWidget {
     required this.showRemoveKey,
     required this.onProviderChanged,
     required this.onRemoveApiKey,
+    required this.onClearChat,
   });
 
   final ChatProviderOption provider;
@@ -975,6 +1073,7 @@ class _ChatModelSelector extends StatelessWidget {
   final bool showRemoveKey;
   final ValueChanged<ChatProviderOption> onProviderChanged;
   final VoidCallback onRemoveApiKey;
+  final VoidCallback onClearChat;
 
   @override
   Widget build(BuildContext context) {
@@ -1026,6 +1125,17 @@ class _ChatModelSelector extends StatelessWidget {
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
                 ),
+              TextButton.icon(
+                onPressed: enabled ? onClearChat : null,
+                icon: const Icon(Icons.refresh_rounded, size: 16),
+                label: const Text('New chat'),
+                style: TextButton.styleFrom(
+                  foregroundColor: RoPacColors.textMuted,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: const Size(0, 36),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
             ],
           ),
         ),
