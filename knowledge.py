@@ -306,11 +306,11 @@ def save_embeddings(
 
 
 def build_embeddings_for_chunks(chunks: list[str]) -> list[list[float]]:
-    from embeddings import embed_model_name, embed_texts
+    from embeddings import embed_document_texts, embed_model_name
 
     if not chunks:
         return []
-    vectors = embed_texts(chunks)
+    vectors = embed_document_texts(chunks)
     if len(vectors) != len(chunks):
         raise ValueError(
             f"Embedding count mismatch: {len(vectors)} vectors for {len(chunks)} chunks"
@@ -616,7 +616,9 @@ def ingest_file_from_text(
 
 def extract_facts_from_document(text: str, model: str, client: Any) -> list[str]:
     sample = text[:8000] if len(text) > 8000 else text
-    response = client.chat.completions.create(
+    from assistant import local_chat_complete_text
+
+    raw = local_chat_complete_text(
         model=model,
         messages=[
             {"role": "system", "content": TRAIN_SUMMARY_PROMPT},
@@ -624,7 +626,6 @@ def extract_facts_from_document(text: str, model: str, client: Any) -> list[str]
         ],
         temperature=0.2,
     )
-    raw = response.choices[0].message.content or "[]"
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:

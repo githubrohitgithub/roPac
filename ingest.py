@@ -97,6 +97,57 @@ def read_file(path: Path) -> str:
     )
 
 
+def chunk_log_lines(
+    text: str,
+    *,
+    size: int = 1500,
+    overlap_lines: int = 5,
+) -> list[str]:
+    """Chunk on line boundaries — keeps log/CSV rows intact for retrieval."""
+    lines = text.splitlines()
+    if not lines:
+        return []
+    if sum(len(line) + 1 for line in lines) <= size:
+        return ["\n".join(lines)]
+
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_chars = 0
+
+    def flush() -> None:
+        nonlocal buf, buf_chars
+        if buf:
+            chunks.append("\n".join(buf))
+
+    for line in lines:
+        add_len = len(line) + (1 if buf else 0)
+        if buf and buf_chars + add_len > size:
+            flush()
+            buf = buf[-overlap_lines:] if overlap_lines else []
+            buf_chars = sum(len(part) + 1 for part in buf)
+        buf.append(line)
+        buf_chars += add_len
+    flush()
+    return chunks
+
+
+def chunk_text_for_path(
+    path: str | Path,
+    text: str,
+    *,
+    size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+) -> list[str]:
+    """Pick chunk strategy from file type — line-aware for logs and tabular text."""
+    p = Path(path)
+    name = p.name.lower()
+    suffix = p.suffix.lower()
+    if suffix in {".log", ".csv", ".tsv"} or "log" in name:
+        overlap_lines = max(3, overlap // 60)
+        return chunk_log_lines(text, size=size, overlap_lines=overlap_lines)
+    return chunk_text(text, size=size, overlap=overlap)
+
+
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     text = re_sub_whitespace(text)
     if not text:

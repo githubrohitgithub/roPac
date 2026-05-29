@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Iterator
@@ -22,6 +23,7 @@ CONFIG_PATH = ROPAC_ROOT / "config.json"
 DATA_DIR = ROPAC_ROOT / "data"
 MEMORY_PATH = DATA_DIR / "memory.json"
 HISTORY_PATH = DATA_DIR / "chat_history.jsonl"
+CHAT_SESSION_ATTACHMENTS_PATH = DATA_DIR / "chat_session_attachments.json"
 LEGACY_MEMORY = Path.home() / ".roPac" / "memory.json"
 
 
@@ -583,10 +585,26 @@ OWNER PROFILE (not the current user unless they say so):
 {owner_profile_preamble()}
 """
     paths = attachment_paths or []
+    from chat_attachments import session_attachment_mode, should_include_attachment_body
+
+    attach_mode = session_attachment_mode(paths) if paths else "none"
+    # Determine the effective mode used for retrieval so we don't double-inject.
+    # "full" = complete file text inline; "chunked" = RAG chunks only; "none" = no files.
+    effective_mode = attach_mode
+    if (
+        attach_mode == "full"
+        and paths
+        and not should_include_attachment_body(user_query, paths)
+    ):
+        # Trivial query (e.g. "hi") — don't flood the prompt with full file text;
+        # use chunked RAG retrieval instead.
+        effective_mode = "chunked"
+
     rag_sections = retrieve_all_context(
         user_query,
         attachment_paths=paths if paths else None,
         has_chat_attachments=has_chat_attachments,
+        session_attachment_mode=effective_mode,
     )
     rag_text = format_rag_for_prompt(rag_sections)
     if rag_text.strip():
@@ -594,14 +612,26 @@ OWNER PROFILE (not the current user unless they say so):
 
 {rag_text.strip()}
 """
-    elif attachment_context.strip():
-        base += f"""
+    # Only add the session attachment context block if it won't duplicate what's
+    # already in rag_text. If effective_mode is "full", the complete text is
+    # already in rag_text via build_query_attachment_context; adding it again
+    # would double the token count and push real content out of the context window.
+    if attachment_context.strip() and effective_mode != "full":
+        ctx = attachment_context.strip()
+        if ctx not in base:
+            base += f"""
 
-{attachment_context.strip()}
+{ctx}
 """
 
+
+    has_attachment_body = (
+        "SESSION ATTACHMENTS" in base
+        or "ATTACHED FILES" in base
+        or bool(rag_sections.get("attachments"))
+    )
     needs_attachment_fallback = (has_chat_attachments or bool(paths)) and not (
-        rag_sections.get("attachments") or attachment_context.strip()
+        has_attachment_body
     )
     if needs_attachment_fallback:
         from chat_attachments import build_attachment_context
@@ -626,33 +656,58 @@ Say what failed (missing file, permissions, or unsupported format) and ask them 
 """
 
     if has_chat_attachments or paths:
-        from log_analysis import build_log_analysis_context, is_log_path
-
-        log_paths = [p for p in paths if is_log_path(p)]
-        if log_paths:
-            log_report = build_log_analysis_context(log_paths, query=user_query)
-            if log_report.strip():
-                base += f"""
-
-{log_report.strip()}
-"""
-
         has_file_content = (
             "ATTACHED FILES" in base
             or "ATTACHED FILES (retrieved" in base
+            or "SESSION ATTACHMENTS" in base
             or bool(rag_sections.get("attachments"))
-            or bool(log_paths)
         )
         if has_file_content:
-            base += """
+            if attach_mode == "full":
+                # Full file text is inline — allow proper analytics: counts, sums, filtering, ranking.
+                analytics_rules = """
+- Complete file text is inline above — you have the ENTIRE content of every attached file.
+- You MUST read and analyse ALL lines in every file, not just the first few.
+- For analytical questions (counts, lists, sums, rankings, filters):
+  * Parse structured data embedded in log lines: JSON blobs, key=value pairs, comma-separated values.
+  * Count every matching occurrence across all files — do NOT stop early.
+  * To extract a value: look for patterns like "productName":"...", totalAmount:N, paymentSplit:{...}, result=..., etc.
+  * For "most ordered" / "most frequent" queries: count occurrences of each unique value and rank them.
+  * For price/amount filters (e.g. > £10): parse numeric values from totalAmount or paymentSplit fields.
+- Only report values that are LITERALLY present in the file content — no invented names, IDs, or amounts.
+- If a file contains 0 results for a query, say "none found in [filename]" — never pad a list.
+- When listing order IDs, use the exact IDs from the log (e.g. PA37252Z260508083525829).
+- When listing errors: use the exact [ComponentName] and message text — never invent exception classes.
+- Show the source filename for each finding so the user can cross-check.
+"""
+                base += f"""
 
 ATTACHMENT RULES (critical):
-- File content and/or LOG ANALYSIS is already in this prompt. Do NOT ask the user to attach again.
-- Answer the user's question directly using LOG ANALYSIS numbers (orders placed, failures, payments, issues).
-- For "total orders" use "Total orders placed (unique IDs)" from LOG ANALYSIS.
-- For failures/issues use ISSUES / ERRORS and order failure counts from LOG ANALYSIS.
-- Never say "let me scan", "please wait", or "allow me a moment".
-- Give counts, order IDs, and findings in this reply — do not defer to a follow-up.
+- Session attachments stay active until New chat. Do NOT ask them to re-attach.
+- Never say you cannot read the user's files when attachment content is present.
+- Never say "let me scan", "please wait", or "allow me a moment".{analytics_rules}"""
+            else:
+                # Partial/grep mode — only show what's in the retrieved chunks, no inference.
+                list_rules = """
+- Use ONLY names/values/lines present in the ATTACHED FILES sections shown above.
+- Do NOT invent, infer, or guess. If a term is missing from a file's content, say "not found in [filename]".
+- If the data does not contain N items, say how many you found — do not pad the list.
+"""
+                mode_note = ""
+                if attach_mode == "chunked":
+                    mode_note = (
+                        "\n- Large upload: every indexed chunk from all files is included above — "
+                        "search across ALL chunks, not just the first file."
+                    )
+                base += f"""
+
+ATTACHMENT RULES (critical):
+- Session attachments stay active until New chat. Do NOT ask them to re-attach.
+- Never say you cannot read the user's files when attachment content is present.
+- Never say "let me scan", "please wait", or "allow me a moment".{mode_note}{list_rules}
+- Answer using facts from the attached files only — ignore OWNER MEMORY for file/log content.
+- Per file: if a term is not literally in that file's content above, say "not found in [filename]".
+- Never assign an error from one file to another. Never invent exception class names.
 """
     return base
 
@@ -685,6 +740,121 @@ def chat_completion_kwargs(*, chat_provider: str = "local") -> dict[str, Any]:
     """Avoid local models stopping mid-answer on long log/file replies."""
     _ = normalize_chat_provider(chat_provider)
     return {"max_tokens": 4096}
+
+
+def _ollama_native_base_url() -> str:
+    base = OLLAMA_BASE_URL.rstrip("/")
+    return base[:-3] if base.endswith("/v1") else base
+
+
+def _ollama_num_ctx_for_messages(messages: list[dict[str, Any]]) -> int:
+    """Smallest context window that fits the prompt — avoids 256K KV cache on 18GB RAM."""
+    cfg = load_config()
+    model_name = cfg.get("model") or "roPac"
+    
+    # Dynamically query the model's actual context length
+    from model_manager import query_model_context_length
+    model_ctx = query_model_context_length(model_name)
+    
+    cfg_max = int(cfg.get("chat_model_context_tokens") or 0)
+    if cfg_max > 0:
+        if model_ctx is not None:
+            cfg_max = min(model_ctx, cfg_max)
+    else:
+        cfg_max = model_ctx or 65536
+        
+    reserved = int(cfg.get("chat_context_reserved_tokens") or 10240)
+    chars_per_token = float(cfg.get("chat_context_chars_per_token") or 3.5)
+    chars = sum(len(str(m.get("content") or "")) for m in messages)
+    need_tokens = int(chars / chars_per_token) + reserved + 4096
+    for bucket in (8192, 16384, 32768, 65536, 131072, 262144, 524288):
+        if bucket >= need_tokens:
+            return min(bucket, cfg_max)
+    return cfg_max
+
+
+def _local_chat_payload(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    stream: bool,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+        "think": False,
+    }
+    options: dict[str, Any] = {"num_ctx": _ollama_num_ctx_for_messages(messages)}
+    if temperature is not None:
+        options["temperature"] = temperature
+    if max_tokens is not None:
+        options["num_predict"] = max_tokens
+    if options:
+        payload["options"] = options
+    return payload
+
+
+def local_chat_complete_text(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    timeout_sec: float = 300.0,
+) -> str:
+    """Native Ollama chat with think=False (Qwen 3.5 returns empty content on /v1)."""
+    payload = _local_chat_payload(
+        model=model,
+        messages=messages,
+        stream=False,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    req = urllib.request.Request(
+        f"{_ollama_native_base_url()}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return str((data.get("message") or {}).get("content") or "")
+
+
+def local_chat_stream_text(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    timeout_sec: float = 300.0,
+) -> Iterator[str]:
+    """Stream native Ollama chat tokens with think=False."""
+    payload = _local_chat_payload(
+        model=model,
+        messages=messages,
+        stream=True,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    req = urllib.request.Request(
+        f"{_ollama_native_base_url()}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8").strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            content = str((data.get("message") or {}).get("content") or "")
+            if content:
+                yield content
 
 
 def get_client(
@@ -726,10 +896,13 @@ def clear_chat_session() -> tuple[str, dict[str, Any]]:
             path.unlink()
             sessions_removed += 1
 
+    attachment_paths_removed = clear_session_attachments()
+
     msg = (
         "Chat cleared — start fresh.\n"
         f"  History log: {'cleared' if history_cleared else 'empty'}\n"
-        f"  Attachment cache removed: {sessions_removed}"
+        f"  Attachment cache removed: {sessions_removed}\n"
+        f"  Session attachment paths cleared: {attachment_paths_removed}"
     )
     return msg, {
         "ok": True,
@@ -841,8 +1014,7 @@ def propose_new_facts(
 
     memory = load_memory(password=owner_password)
     existing = {f.strip().lower() for f in memory.get("facts", [])}
-    client = get_client()
-    response = client.chat.completions.create(
+    raw = local_chat_complete_text(
         model=model,
         messages=[
             {"role": "system", "content": EXTRACT_PROMPT.format(existing=existing)},
@@ -850,7 +1022,6 @@ def propose_new_facts(
         ],
         temperature=0.2,
     )
-    raw = response.choices[0].message.content or "[]"
     candidates = _parse_facts_json(raw)
     return [
         fact.strip()
@@ -968,6 +1139,83 @@ def _normalize_attachment_paths(paths: list[str] | None) -> list[str]:
     return out
 
 
+def _read_session_attachment_paths() -> list[str]:
+    """Load attachment paths for the current chat session (survives bridge restarts)."""
+    ensure_data_dir()
+    if not CHAT_SESSION_ATTACHMENTS_PATH.is_file():
+        return []
+    try:
+        data = json.loads(CHAT_SESSION_ATTACHMENTS_PATH.read_text(encoding="utf-8"))
+        raw = data.get("paths") or []
+    except (json.JSONDecodeError, OSError):
+        return []
+    out: list[str] = []
+    for item in raw:
+        resolved = str(Path(str(item)).expanduser())
+        if resolved in out:
+            continue
+        if Path(resolved).is_file():
+            out.append(resolved)
+    return out
+
+
+def _write_session_attachment_paths(paths: list[str]) -> None:
+    ensure_data_dir()
+    CHAT_SESSION_ATTACHMENTS_PATH.write_text(
+        json.dumps({"paths": paths}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def clear_session_attachments() -> int:
+    """Drop chat session attachment paths (New chat / clear session)."""
+    removed = len(_read_session_attachment_paths())
+    if CHAT_SESSION_ATTACHMENTS_PATH.is_file():
+        CHAT_SESSION_ATTACHMENTS_PATH.unlink()
+    return removed
+
+
+def resolve_chat_attachment_paths(
+    paths: list[str] | None,
+    *,
+    fresh_session: bool = False,
+) -> list[str]:
+    """Keep attachment paths for the whole chat thread, not only the first message.
+
+    New paths (just picked by the user) are trusted unconditionally — the UI
+    already confirmed they exist. Only pre-existing session paths are filtered
+    to remove files that have since been deleted from disk.
+    """
+    if fresh_session:
+        clear_session_attachments()
+        merged: list[str] = []
+    else:
+        # Filter pre-existing session paths: keep only files still on disk.
+        merged = [p for p in _read_session_attachment_paths() if Path(p).is_file()]
+
+    for raw in _normalize_attachment_paths(paths):
+        resolved = str(Path(raw).expanduser())
+        if resolved in merged:
+            continue
+        # Trust new paths from the UI unconditionally (don't silently erase them).
+        merged.append(resolved)
+
+    _write_session_attachment_paths(merged)
+    return list(merged)
+
+
+
+def build_session_attachment_context(
+    paths: list[str],
+    *,
+    query: str = "",
+) -> str:
+    """Attachment content for every turn until New chat (generic — any file type)."""
+    from chat_attachments import build_query_attachment_context
+
+    return build_query_attachment_context(paths, query=query)
+
+
 def _build_chat_messages(
     user_message: str,
     history: list[dict[str, str]] | None,
@@ -982,7 +1230,8 @@ def _build_chat_messages(
         openai_api_key_override=openai_api_key_override,
     )
     paths = _normalize_attachment_paths(attachment_paths)
-    attachment_context = ""
+    session_context = build_session_attachment_context(paths, query=user_message)
+    attachment_context = session_context
     use_attachment_rag = False
     if paths:
         from rag import load_rag_config
@@ -990,7 +1239,7 @@ def _build_chat_messages(
         use_attachment_rag = bool(
             load_rag_config().get("rag_attachment_rag_enabled", True)
         )
-        if not use_attachment_rag:
+        if not session_context and not use_attachment_rag:
             from chat_attachments import build_attachment_context
 
             attachment_context, _ = build_attachment_context(paths)
@@ -998,7 +1247,7 @@ def _build_chat_messages(
         user_message,
         attachment_context=attachment_context,
         has_chat_attachments=bool(paths),
-        attachment_paths=paths if use_attachment_rag else [],
+        attachment_paths=paths,
         chat_provider=chat_provider,
     )
     web_context = ""
@@ -1124,19 +1373,30 @@ def chat_stream(
         openai_api_key_override=openai_api_key_override,
         attachment_paths=attachment_paths,
     )
-    stream = client.chat.completions.create(
-        model=chat_model,
-        messages=messages,
-        stream=True,
-        **chat_completion_kwargs(chat_provider=chat_provider),
-    )
+    completion_kwargs = chat_completion_kwargs(chat_provider=chat_provider)
     parts: list[str] = []
-    for event in stream:
-        delta = event.choices[0].delta.content or ""
-        if not delta:
-            continue
-        parts.append(delta)
-        yield delta
+    if normalize_chat_provider(chat_provider) == "local":
+        stream = local_chat_stream_text(
+            model=chat_model,
+            messages=messages,
+            max_tokens=completion_kwargs.get("max_tokens"),
+        )
+        for delta in stream:
+            parts.append(delta)
+            yield delta
+    else:
+        stream = client.chat.completions.create(
+            model=chat_model,
+            messages=messages,
+            stream=True,
+            **completion_kwargs,
+        )
+        for event in stream:
+            delta = event.choices[0].delta.content or ""
+            if not delta:
+                continue
+            parts.append(delta)
+            yield delta
 
     reply = "".join(parts)
     full, suggestions = _finalize_chat_reply(
@@ -1192,12 +1452,20 @@ def chat(
         openai_api_key_override=openai_api_key_override,
         attachment_paths=attachment_paths,
     )
-    response = client.chat.completions.create(
-        model=chat_model,
-        messages=messages,
-        **chat_completion_kwargs(chat_provider=chat_provider),
-    )
-    reply = response.choices[0].message.content or ""
+    completion_kwargs = chat_completion_kwargs(chat_provider=chat_provider)
+    if normalize_chat_provider(chat_provider) == "local":
+        reply = local_chat_complete_text(
+            model=chat_model,
+            messages=messages,
+            max_tokens=completion_kwargs.get("max_tokens"),
+        )
+    else:
+        response = client.chat.completions.create(
+            model=chat_model,
+            messages=messages,
+            **completion_kwargs,
+        )
+        reply = response.choices[0].message.content or ""
     full, suggestions = _finalize_chat_reply(
         user_message,
         reply,

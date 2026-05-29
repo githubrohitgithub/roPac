@@ -345,12 +345,33 @@ def model_catalog() -> dict[str, Any]:
     }
 
 
+def query_model_context_length(model_name: str) -> int | None:
+    """Query local Ollama api/show for the context length of a model."""
+    import json
+    import urllib.request
+    try:
+        url = "http://127.0.0.1:11434/api/show"
+        data = json.dumps({"name": model_name}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            model_info = res.get("model_info", {})
+            for k, v in model_info.items():
+                if k.endswith(".context_length"):
+                    return int(v)
+    except Exception:
+        pass
+    return None
+
+
 def update_modelfile_from(base_model: str) -> None:
     if not MODELFILE_PATH.is_file():
         raise FileNotFoundError(f"Modelfile not found: {MODELFILE_PATH}")
     text = MODELFILE_PATH.read_text(encoding="utf-8")
     if not re.search(r"^FROM\s+", text, flags=re.MULTILINE):
         raise ValueError("Modelfile has no FROM line")
+    
+    # 1. Update FROM line
     new_text = re.sub(
         r"^FROM\s+.+$",
         f"FROM {base_model}",
@@ -358,6 +379,26 @@ def update_modelfile_from(base_model: str) -> None:
         count=1,
         flags=re.MULTILINE,
     )
+    
+    # 2. Dynamically fetch and update PARAMETER num_ctx line if possible
+    ctx_len = query_model_context_length(base_model)
+    if ctx_len:
+        cfg = load_config()
+        # Cap it using user-defined cap if present (defaults to 131072 for safety if not set)
+        cap = int(cfg.get("chat_model_context_tokens") or 131072)
+        ctx_len = min(ctx_len, cap)
+        
+        if re.search(r"^PARAMETER\s+num_ctx\s+\d+", new_text, flags=re.MULTILINE):
+            new_text = re.sub(
+                r"^PARAMETER\s+num_ctx\s+\d+",
+                f"PARAMETER num_ctx {ctx_len}",
+                new_text,
+                count=1,
+                flags=re.MULTILINE,
+            )
+        else:
+            new_text += f"\nPARAMETER num_ctx {ctx_len}\n"
+            
     MODELFILE_PATH.write_text(new_text, encoding="utf-8")
 
 

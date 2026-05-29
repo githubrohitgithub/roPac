@@ -102,6 +102,10 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _waitingForStream = false;
   bool _freshSession = false;
   final List<_PendingAttachment> _attachments = [];
+  final List<String> _sessionAttachmentPaths = [];
+
+  bool get _isGenerating =>
+      _loading || _messages.any((message) => message.isStreaming);
 
   @override
   void initState() {
@@ -420,11 +424,24 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _stopGeneration() async {
-    if (!_loading) return;
+    if (!_isGenerating) return;
     await _replySpeech?.stopAll();
     await widget.ropac.interruptGeneration();
     if (!mounted) return;
     setState(() {
+      final idx = _messages.lastIndexWhere((m) => m.isStreaming);
+      if (idx >= 0) {
+        final msg = _messages[idx];
+        if (msg.content.isEmpty) {
+          _messages.removeAt(idx);
+        } else {
+          _messages[idx] = ChatMessage(
+            role: 'assistant',
+            content: msg.content,
+            isStreaming: false,
+          );
+        }
+      }
       _loading = false;
       _waitingForStream = false;
     });
@@ -499,6 +516,7 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _messages.clear();
       _attachments.clear();
+      _sessionAttachmentPaths.clear();
       _loading = false;
       _waitingForStream = false;
       _freshSession = true;
@@ -657,13 +675,25 @@ class _ChatScreenState extends State<ChatScreen> {
     await _voice?.stopAll();
     await _replySpeech?.stopAll();
 
-    final attachmentPaths = _attachments.map((a) => a.path).toList();
+    final newAttachmentPaths = _attachments.map((a) => a.path).toList();
+    for (final path in newAttachmentPaths) {
+      if (!_sessionAttachmentPaths.contains(path)) {
+        _sessionAttachmentPaths.add(path);
+      }
+    }
+    final attachmentPaths = List<String>.from(_sessionAttachmentPaths);
     final userDisplay = _displayUserMessage(rawText);
 
     setState(() {
       _loading = true;
       _waitingForStream = true;
-      _messages.add(ChatMessage(role: 'user', content: userDisplay));
+      _messages.add(ChatMessage(
+        role: 'user',
+        content: userDisplay,
+        // rawContent is the clean question without emoji attachment prefix lines.
+        // toJson() uses this for history so the LLM sees only the actual question.
+        rawContent: rawText.isEmpty ? null : rawText,
+      ));
       _messages.add(
         const ChatMessage(role: 'assistant', content: '', isStreaming: true),
       );
@@ -694,7 +724,6 @@ class _ChatScreenState extends State<ChatScreen> {
           setState(() {
             if (_waitingForStream) {
               _waitingForStream = false;
-              _loading = false;
             }
             final prev = _messages[assistantIdx].content;
             _messages[assistantIdx] = ChatMessage(
@@ -732,7 +761,6 @@ class _ChatScreenState extends State<ChatScreen> {
             setState(() {
               if (_waitingForStream) {
                 _waitingForStream = false;
-                _loading = false;
               }
               final prev = _messages[assistantIdx].content;
               _messages[assistantIdx] = ChatMessage(
@@ -809,7 +837,6 @@ class _ChatScreenState extends State<ChatScreen> {
               setState(() {
                 if (_waitingForStream) {
                   _waitingForStream = false;
-                  _loading = false;
                 }
                 final prev = _messages[assistantIdx].content;
                 _messages[assistantIdx] = ChatMessage(
@@ -975,7 +1002,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final inputEnabled = widget.enabled && !_loading && !_micSession;
+    final inputEnabled = widget.enabled && !_isGenerating && !_micSession;
 
     return Container(
       color: RoPacColors.bgMid.withValues(alpha: 0.5),
@@ -1044,7 +1071,7 @@ class _ChatScreenState extends State<ChatScreen> {
             controller: _input,
             focusNode: _inputFocus,
             enabled: inputEnabled,
-            loading: _loading,
+            loading: _isGenerating,
             speakAloud: _speakAloud,
             canSend: _input.text.trim().isNotEmpty || _attachments.isNotEmpty,
             onToggleSpeak: _toggleSpeakAloud,
@@ -1267,7 +1294,9 @@ class _ChatInput extends StatelessWidget {
                     ? onStop
                     : (enabled && canSend ? onSend : null),
                 borderRadius: BorderRadius.circular(12),
-                child: Ink(
+                child: Tooltip(
+                  message: loading ? 'Stop generating' : 'Send message',
+                  child: Ink(
                   width: 44,
                   height: 44,
                   decoration: BoxDecoration(
@@ -1297,6 +1326,7 @@ class _ChatInput extends StatelessWidget {
                 ),
               ),
             ),
+          ),
           ],
         ),
       ),

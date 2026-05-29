@@ -38,13 +38,32 @@ def embed_model_name() -> str:
     return str(load_embed_config().get("embed_model") or DEFAULT_EMBED_MODEL)
 
 
-def embeddings_enabled() -> bool:
-    return bool(load_embed_config().get("embeddings_enabled", True))
+def _prepare_query_text(text: str) -> str:
+    """Model-specific query prefix (nomic expects search_query:)."""
+    q = text.strip()
+    if not q:
+        return q
+    model = embed_model_name().lower()
+    if "nomic" in model and not q.lower().startswith("search_query:"):
+        return f"search_query: {q}"
+    return q
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def _prepare_document_text(text: str) -> str:
+    """Model-specific document prefix for indexing."""
+    doc = text.strip()
+    if not doc:
+        return doc
+    model = embed_model_name().lower()
+    if "nomic" in model and not doc.lower().startswith("search_document:"):
+        return f"search_document: {doc}"
+    return doc
+
+
+def embed_texts(texts: list[str], *, for_documents: bool = False) -> list[list[float]]:
     """Embed one or more texts. Raises on Ollama/model errors."""
-    cleaned = [t.strip() for t in texts if t and t.strip()]
+    prep = _prepare_document_text if for_documents else (lambda t: t.strip())
+    cleaned = [prep(t) for t in texts if t and t.strip()]
     if not cleaned:
         return []
 
@@ -61,8 +80,17 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
+def embeddings_enabled() -> bool:
+    return bool(load_embed_config().get("embeddings_enabled", True))
+
+
+def embed_document_texts(texts: list[str]) -> list[list[float]]:
+    """Embed chunks for indexing (applies document prefix when required)."""
+    return embed_texts(texts, for_documents=True)
+
+
 def embed_query(text: str) -> list[float]:
-    vectors = embed_texts([text])
+    vectors = embed_texts([_prepare_query_text(text)])
     if not vectors:
         raise ValueError("Empty query embedding")
     return vectors[0]

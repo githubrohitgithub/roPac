@@ -139,18 +139,18 @@ def _warm_model(model_name: str, *, timeout_sec: float = 90.0) -> tuple[bool, st
     """Load weights with a ceiling so the UI does not hang forever."""
     import threading
 
-    from assistant import get_client
+    from assistant import local_chat_stream_text
 
     result: dict[str, Any] = {"ok": False, "err": ""}
 
     def worker() -> None:
         try:
-            client = get_client()
-            stream = client.chat.completions.create(
+            stream = local_chat_stream_text(
                 model=model_name,
                 messages=[{"role": "user", "content": " "}],
-                stream=True,
-                temperature=0,
+                temperature=0.0,
+                max_tokens=8,
+                timeout_sec=timeout_sec,
             )
             for _ in stream:
                 result["ok"] = True
@@ -529,11 +529,14 @@ def _handle(req: dict[str, Any]) -> None:
         return
 
     if action == "chat":
-        from assistant import chat, needs_personal_vault_for_message
+        from assistant import chat, needs_personal_vault_for_message, resolve_chat_attachment_paths
         from data_crypto import require_unlocked_session
 
         message = str(req.get("message", "")).strip()
-        attachment_paths = _attachment_paths_from_req(req)
+        attachment_paths = resolve_chat_attachment_paths(
+            _attachment_paths_from_req(req),
+            fresh_session=bool(req.get("fresh_session")),
+        )
         if not message and not attachment_paths:
             _err("Empty message")
         if not message and attachment_paths:
@@ -597,11 +600,14 @@ def _handle(req: dict[str, Any]) -> None:
         return
 
     if action == "chat_stream":
-        from assistant import chat_stream, needs_personal_vault_for_message
+        from assistant import chat_stream, needs_personal_vault_for_message, resolve_chat_attachment_paths
         from data_crypto import require_unlocked_session
 
         message = str(req.get("message", "")).strip()
-        attachment_paths = _attachment_paths_from_req(req)
+        attachment_paths = resolve_chat_attachment_paths(
+            _attachment_paths_from_req(req),
+            fresh_session=bool(req.get("fresh_session")),
+        )
         if not message and not attachment_paths:
             _stream_event({"ok": False, "error": "Empty message"})
             return

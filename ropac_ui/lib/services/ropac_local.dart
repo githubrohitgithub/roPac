@@ -173,6 +173,7 @@ class RopacLocal {
     String chatProvider = 'local',
     String? openaiApiKey,
     String? ownerPassword,
+    List<String> attachmentPaths = const [],
   }) async {
     final payload = <String, dynamic>{
       'action': 'chat',
@@ -190,9 +191,13 @@ class RopacLocal {
     if (ownerPassword != null && ownerPassword.isNotEmpty) {
       payload['password'] = ownerPassword;
     }
+    if (attachmentPaths.isNotEmpty) {
+      payload['attachment_paths'] = attachmentPaths;
+    }
     final data = await _invokeCancellable(payload);
     return data['reply'] as String? ?? '';
   }
+
 
   /// Stream assistant reply chunks (Ollama streaming via bridge NDJSON).
   Future<Map<String, dynamic>> parseAttachment(String filePath) async {

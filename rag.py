@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ingest import chunk_text
+from ingest import chunk_text_for_path
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parent / "data" / "knowledge"
 MEMORY_EMBED_PATH = KNOWLEDGE_DIR / "memory.embeddings.json"
@@ -36,7 +36,12 @@ def load_rag_config() -> dict[str, Any]:
         "rag_memory_enabled": True,
         "rag_attachment_rag_enabled": True,
         "rag_top_memory_facts": 6,
-        "rag_top_attachment_chunks": 4,
+        "rag_top_attachment_chunks": 8,
+        "rag_attachment_chunk_size": 1500,
+        "rag_attachment_chunk_overlap": 200,
+        "rag_attachment_min_chunks_per_file": 4,
+        "rag_attachment_max_chunks": 64,
+        "rag_hybrid_keyword_weight": 0.35,
         "rag_min_memory_cosine_similarity": 0.22,
         "rag_min_memory_keyword_score": 0.08,
     }
@@ -265,9 +270,13 @@ def _session_path(session_key: str) -> Path:
 def index_attachment_paths(
     paths: list[str], *, owner_password: str | None = None
 ) -> bool:
-    from chat_attachments import extract_attachment_text
+    from chat_attachments import read_attachment_full_text
     from embeddings import embed_model_name, embeddings_enabled
     from knowledge import build_embeddings_for_chunks
+
+    cfg = load_rag_config()
+    chunk_size = _rag_int(cfg, "rag_attachment_chunk_size", 1500)
+    chunk_overlap = _rag_int(cfg, "rag_attachment_chunk_overlap", 200)
 
     if not embeddings_enabled() or not paths:
         return False
@@ -283,17 +292,21 @@ def index_attachment_paths(
     chunks: list[str] = []
     labels: list[str] = []
     for raw in paths:
-        result = extract_attachment_text(raw)
-        name = str(result.get("name") or Path(raw).name)
-        if not result.get("ok"):
+        file_path = Path(raw).expanduser()
+        name = file_path.name
+        try:
+            text, _kind = read_attachment_full_text(file_path)
+        except (OSError, ValueError):
             continue
-        text = str(result.get("text") or "").strip()
+        text = text.strip()
         if not text:
             continue
-        file_chunks = chunk_text(text, size=800, overlap=100)
-        for ci, ch in enumerate(file_chunks):
+        file_chunks = chunk_text_for_path(
+            file_path, text, size=chunk_size, overlap=chunk_overlap
+        )
+        for ch in file_chunks:
             chunks.append(ch)
-            labels.append(f"{name}")
+            labels.append(name)
 
     if not chunks:
         return False
@@ -322,6 +335,7 @@ def retrieve_attachment_context(
     *,
     owner_password: str | None = None,
     top_k: int | None = None,
+    max_chars: int | None = None,
 ) -> str:
     from embeddings import cosine_similarity, embed_query, embeddings_enabled
     from knowledge import _is_trivial_message, _score_chunk, _tokenize
@@ -333,7 +347,7 @@ def retrieve_attachment_context(
     if not q or _is_trivial_message(q):
         return ""
 
-    k = top_k if top_k is not None else _rag_int(cfg, "rag_top_attachment_chunks", 4)
+    k = top_k if top_k is not None else _rag_int(cfg, "rag_top_attachment_chunks", 8)
     cite = bool(cfg.get("rag_chunk_citations", True))
 
     if not index_attachment_paths(paths, owner_password=owner_password):
@@ -378,16 +392,313 @@ def retrieve_attachment_context(
                 hits.append(RagHit(score, f"{label} — attachment", ch, i))
 
     min_cos = _rag_float(cfg, "rag_min_cosine_similarity", 0.28)
+    char_limit = max_chars if max_chars is not None else 6000
     return _format_hits(
         hits,
         k,
         min_score=min_cos,
-        max_chars=6000,
+        max_chars=char_limit,
         cite_chunks=cite,
     )
 
 
+def _blend_attachment_score(
+    cosine: float, keyword: float, *, keyword_weight: float
+) -> float:
+    kw = min(keyword / 2.0, 1.0)
+    return (1.0 - keyword_weight) * cosine + keyword_weight * kw
+
+
+def _attachment_file_label(hit: RagHit) -> str:
+    return hit.source.split(" — ", 1)[0]
+
+
+def retrieve_attachment_hybrid(
+    query: str,
+    paths: list[str],
+    *,
+    owner_password: str | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """
+    Hybrid vector + keyword retrieval with per-file minimum coverage.
+    Ensures all uploaded files contribute chunks, not only the top global matches.
+    """
+    from chat_attachments import resolve_attachment_char_budgets
+    from knowledge import _is_trivial_message, _tokenize
+    from embeddings import cosine_similarity, embed_query, embeddings_enabled
+    from knowledge import _is_trivial_message, _score_chunk, _tokenize
+
+    cfg = load_rag_config()
+    if not cfg.get("rag_attachment_rag_enabled", True) or not paths:
+        return ""
+    q = query.strip()
+    if not q or _is_trivial_message(q):
+        return ""
+
+    if not index_attachment_paths(paths, owner_password=owner_password):
+        return ""
+
+    session_key = _attachment_session_key(paths)
+    store = _read_store(_session_path(session_key), owner_password=owner_password)
+    if not store:
+        return ""
+
+    chunks = store.get("chunks") or []
+    labels = store.get("labels") or []
+    vectors = store.get("vectors") or []
+    if not chunks:
+        return ""
+
+    kw_weight = _rag_float(cfg, "rag_hybrid_keyword_weight", 0.35)
+    min_per_file = _rag_int(cfg, "rag_attachment_min_chunks_per_file", 4)
+    max_chunks = _rag_int(cfg, "rag_attachment_max_chunks", 64)
+    if len(_tokenize(q)) >= 4:
+        max_chunks = max(max_chunks, min(len(chunks), 120))
+
+    from chat_attachments import resolve_attachment_char_budgets
+
+    char_limit = max_chars
+    if char_limit is None:
+        _full, char_limit = resolve_attachment_char_budgets()
+
+    cite = bool(cfg.get("rag_chunk_citations", True))
+    min_cos = _rag_float(cfg, "rag_min_cosine_similarity", 0.28)
+    tokens = _tokenize(q)
+
+    hits: list[RagHit] = []
+    if embeddings_enabled() and len(vectors) == len(chunks):
+        try:
+            qvec = embed_query(q)
+            for i, (vec, ch) in enumerate(zip(vectors, chunks)):
+                label = labels[i] if i < len(labels) else "attachment"
+                cos = cosine_similarity(qvec, vec)
+                kw = _score_chunk(tokens, ch)
+                score = _blend_attachment_score(cos, kw, keyword_weight=kw_weight)
+                if score > 0:
+                    hits.append(
+                        RagHit(score, f"{label} — attachment", ch, i)
+                    )
+        except Exception:
+            hits = []
+
+    if not hits:
+        for i, ch in enumerate(chunks):
+            label = labels[i] if i < len(labels) else "attachment"
+            kw = _score_chunk(tokens, ch)
+            if kw > 0:
+                hits.append(RagHit(kw, f"{label} — attachment", ch, i))
+
+    if not hits:
+        return ""
+
+    hits.sort(key=lambda h: h.score, reverse=True)
+    by_file: dict[str, list[RagHit]] = {}
+    for hit in hits:
+        by_file.setdefault(_attachment_file_label(hit), []).append(hit)
+
+    selected: list[RagHit] = []
+    picked: set[int] = set()
+
+    for _round in range(min_per_file):
+        for file_hits in by_file.values():
+            if _round >= len(file_hits):
+                continue
+            hit = file_hits[_round]
+            if hit.chunk_index in picked:
+                continue
+            selected.append(hit)
+            picked.add(hit.chunk_index)
+
+    for hit in hits:
+        if len(selected) >= max_chunks:
+            break
+        if hit.chunk_index in picked:
+            continue
+        if hit.score < min_cos and len(selected) >= min_per_file * max(len(by_file), 1):
+            continue
+        selected.append(hit)
+        picked.add(hit.chunk_index)
+
+    selected.sort(key=lambda h: h.score, reverse=True)
+    return _format_hits(
+        selected,
+        len(selected),
+        min_score=0.0,
+        max_chars=char_limit,
+        cite_chunks=cite,
+    )
+
+
+def retrieve_attachment_query_budget(
+    query: str,
+    paths: list[str],
+    *,
+    owner_password: str | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """
+    For count/list questions: pack the context budget with the most query-relevant
+    chunks from ALL files (not sequential dump from file 1 first).
+    """
+    from embeddings import cosine_similarity, embed_query, embeddings_enabled
+    from knowledge import _is_trivial_message, _score_chunk, _tokenize
+
+    cfg = load_rag_config()
+    if not cfg.get("rag_attachment_rag_enabled", True) or not paths:
+        return ""
+    q = query.strip()
+    if not q or _is_trivial_message(q):
+        return ""
+
+    if not index_attachment_paths(paths, owner_password=owner_password):
+        return ""
+
+    session_key = _attachment_session_key(paths)
+    store = _read_store(_session_path(session_key), owner_password=owner_password)
+    if not store:
+        return ""
+
+    chunks = store.get("chunks") or []
+    labels = store.get("labels") or []
+    vectors = store.get("vectors") or []
+    if not chunks:
+        return ""
+
+    from chat_attachments import enumeration_query_tokens, resolve_attachment_char_budgets
+
+    char_limit = max_chars
+    if char_limit is None:
+        _full, char_limit = resolve_attachment_char_budgets()
+
+    kw_weight = 0.7
+    cite = bool(cfg.get("rag_chunk_citations", True))
+    tokens = enumeration_query_tokens(q)
+
+    hits: list[RagHit] = []
+    if embeddings_enabled() and len(vectors) == len(chunks):
+        try:
+            qvec = embed_query(q)
+            for i, (vec, ch) in enumerate(zip(vectors, chunks)):
+                label = labels[i] if i < len(labels) else "attachment"
+                cos = cosine_similarity(qvec, vec)
+                kw = _score_chunk(tokens, ch)
+                score = _blend_attachment_score(cos, kw, keyword_weight=kw_weight)
+                hits.append(RagHit(score, f"{label} — attachment", ch, i))
+        except Exception:
+            hits = []
+
+    if not hits:
+        for i, ch in enumerate(chunks):
+            label = labels[i] if i < len(labels) else "attachment"
+            kw = _score_chunk(tokens, ch)
+            hits.append(RagHit(kw, f"{label} — attachment", ch, i))
+
+    hits.sort(key=lambda h: h.score, reverse=True)
+    return _format_hits(
+        hits,
+        len(hits),
+        min_score=0.0,
+        max_chars=char_limit,
+        cite_chunks=cite,
+    )
+
+
+def retrieve_attachment_all_chunks(
+    paths: list[str],
+    *,
+    owner_password: str | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """Return indexed chunks from ALL session files (not top-k sampling)."""
+    from chat_attachments import resolve_attachment_char_budgets
+
+    cfg = load_rag_config()
+    if not cfg.get("rag_attachment_rag_enabled", True) or not paths:
+        return ""
+
+    if not index_attachment_paths(paths, owner_password=owner_password):
+        return ""
+
+    session_key = _attachment_session_key(paths)
+    store = _read_store(_session_path(session_key), owner_password=owner_password)
+    if not store:
+        return ""
+
+    chunks = store.get("chunks") or []
+    labels = store.get("labels") or []
+    if not chunks:
+        return ""
+
+    from chat_attachments import resolve_attachment_char_budgets
+
+    char_limit = max_chars
+    if char_limit is None:
+        _full, char_limit = resolve_attachment_char_budgets()
+
+    cite = bool(cfg.get("rag_chunk_citations", True))
+    parts: list[str] = []
+    used = 0
+    omitted = 0
+    for i, ch in enumerate(chunks):
+        label = labels[i] if i < len(labels) else "attachment"
+        header = f"[{label}#{i + 1}]" if cite else f"[{label}]"
+        block = f"{header}\n{ch}"
+        if used + len(block) + 2 > char_limit:
+            omitted = len(chunks) - i
+            break
+        parts.append(block)
+        used += len(block) + 2
+
+    if not parts:
+        return ""
+
+    body = "\n\n".join(parts)
+    if omitted > 0:
+        body += (
+            f"\n\n[... {omitted} more chunks omitted — raise chat_model_context_tokens "
+            f"in config.json if Ollama uses a larger context (e.g. 262144 for 256K) ...]"
+        )
+
+    return (
+        "ATTACHED FILES (complete indexed content from all session files):\n\n"
+        + body
+    )
+
+
 # --- Unified retrieval ---
+
+
+def retrieve_attachment_for_query(
+    query: str,
+    paths: list[str],
+    *,
+    owner_password: str | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """
+    Generic attachment retrieval: literal grep from user's words + semantic hybrid fallback.
+    No hardcoded question-type patterns.
+    """
+    from chat_attachments import grep_session_for_query, resolve_attachment_char_budgets
+    from knowledge import _is_trivial_message
+
+    q = query.strip()
+    if not q or _is_trivial_message(q) or not paths:
+        return ""
+
+    _full, limit = resolve_attachment_char_budgets()
+    budget = max_chars if max_chars is not None else limit
+    grep_part = grep_session_for_query(paths, q, max_chars=max(budget // 2, 4000))
+    used = len(grep_part)
+    remaining = max(budget - used - 4, 0)
+    hybrid_part = ""
+    if remaining > 800:
+        hybrid_part = retrieve_attachment_hybrid(
+            q, paths, owner_password=owner_password, max_chars=remaining
+        )
+    parts = [part.strip() for part in (grep_part, hybrid_part) if part.strip()]
+    return "\n\n".join(parts)
 
 
 def retrieve_all_context(
@@ -396,6 +707,7 @@ def retrieve_all_context(
     attachment_paths: list[str] | None = None,
     has_chat_attachments: bool = False,
     owner_password: str | None = None,
+    session_attachment_mode: str = "none",
 ) -> dict[str, str]:
     """
     Run all enabled retrievers. Returns section_key -> formatted context.
@@ -408,7 +720,8 @@ def retrieve_all_context(
     has_attachments = has_chat_attachments or bool(paths)
     sections: dict[str, str] = {}
 
-    if cfg.get("rag_memory_enabled", True):
+    # Owner memory can contradict fresh attachments (e.g. old log summaries) — skip when files attached.
+    if cfg.get("rag_memory_enabled", True) and not has_attachments:
         mem = retrieve_memory_context(
             query, owner_password=owner_password
         )
@@ -424,11 +737,16 @@ def retrieve_all_context(
             sections["documents"] = docs.strip()
 
     if has_attachments and cfg.get("rag_attachment_rag_enabled", True):
-        att = retrieve_attachment_context(
-            query, paths, owner_password=owner_password
-        )
-        if att.strip():
-            sections["attachments"] = att.strip()
+        from knowledge import _is_trivial_message
+
+        needs_search = bool(query.strip()) and not _is_trivial_message(query)
+        # Full inline mode: every byte is already in SESSION ATTACHMENTS — skip RAG.
+        if session_attachment_mode != "full" and needs_search:
+            att = retrieve_attachment_for_query(
+                query, paths, owner_password=owner_password
+            )
+            if att.strip():
+                sections["attachments"] = att.strip()
 
     return sections
 
