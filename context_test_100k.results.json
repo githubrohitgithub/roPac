@@ -1,0 +1,58 @@
+[
+  {
+    "label": "fact_beginning",
+    "question": "What animal sleeps under the silver bridge?",
+    "passed": false,
+    "detail": "missing ['blue tiger', 'tiger']",
+    "elapsed_s": 105.83,
+    "answer_preview": ""
+  },
+  {
+    "label": "fact_middle",
+    "question": "Which employee ID belongs to Jonathan Miles?",
+    "passed": false,
+    "detail": "missing ['84721']",
+    "elapsed_s": 78.0,
+    "answer_preview": ""
+  },
+  {
+    "label": "fact_deep_middle",
+    "question": "What is the secret launch code?",
+    "passed": false,
+    "detail": "missing ['orbit-9921-x', 'orbit-9921']",
+    "elapsed_s": 196.5,
+    "answer_preview": ""
+  },
+  {
+    "label": "fact_near_end",
+    "question": "What does Rohit prefer over smartwatches?",
+    "passed": false,
+    "detail": "missing ['analog watch', 'analog watches']",
+    "elapsed_s": 224.1,
+    "answer_preview": ""
+  },
+  {
+    "label": "fact_end",
+    "question": "What is the final verification number?",
+    "passed": true,
+    "detail": "matched",
+    "elapsed_s": 20.31,
+    "answer_preview": "The final verification number is 558391."
+  },
+  {
+    "label": "hallucination_guard",
+    "question": "What was the Mars access password?",
+    "passed": false,
+    "detail": "may have hallucinated",
+    "elapsed_s": 34.49,
+    "answer_preview": ""
+  },
+  {
+    "label": "cross_reference",
+    "question": "List all special memory facts hidden in this document, in the order they appear.",
+    "passed": false,
+    "detail": "recalled 0/6 facts",
+    "elapsed_s": 37.03,
+    "answer_preview": ""
+  }
+]
