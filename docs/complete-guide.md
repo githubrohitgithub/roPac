@@ -191,7 +191,8 @@ RoPac is ready
 | `base_model` | `qwen2.5-coder:latest` | Underlying LLM |
 | `model` | `roPac` | Custom personality (`Modelfile`) |
 | `embed_model` | `nomic-embed-text` | Document search / RAG |
-| `vision_model` | `moondream` | Images (optional) |
+
+Image attachments use **moondream** (`ollama pull moondream`) — not configurable in `config.json`.
 
 ### Manual download
 

@@ -33,7 +33,6 @@ def load_config() -> dict[str, Any]:
         "embeddings_enabled": True,
         "ollama_base_url": "http://localhost:11434/v1",
         "openai_base_url": "https://api.openai.com/v1",
-        "openai_model": "gpt-4o-mini",
         "coder_model": "qwen2.5-coder:latest",
         "owner": "Rohit",
         "assistant_name": "RoPac",
@@ -71,7 +70,7 @@ _load_ropac_env_file()
 _CONFIG = load_config()
 OLLAMA_BASE_URL = str(_CONFIG["ollama_base_url"])
 OPENAI_BASE_URL = str(_CONFIG.get("openai_base_url") or "https://api.openai.com/v1")
-OPENAI_MODEL = str(_CONFIG.get("openai_model") or "gpt-4o-mini")
+OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_MODEL = str(_CONFIG["model"])
 
 CHAT_PROVIDERS = frozenset({"local", "openai"})
@@ -531,18 +530,38 @@ def memory_block() -> str:
     return "\n".join(lines)
 
 
+def _identity_prompt_block(*, chat_provider: str = "local") -> str:
+    provider = normalize_chat_provider(chat_provider)
+    if provider == "openai":
+        return """IDENTITY:
+- You are RoPac. The user selected OpenAI (paid) cloud chat for this session.
+- If asked which service you use, say OpenAI API for this chat — not local Ollama.
+"""
+    model = resolve_chat_model(chat_provider="local")
+    base = str(_CONFIG.get("base_model") or "").strip()
+    under = f" Underlying Ollama base: {base}." if base else ""
+    return f"""IDENTITY (critical):
+- You are RoPac — local assistant on this Mac via Ollama. You are NOT ChatGPT, NOT GPT-4, NOT OpenAI.
+- Active model: {model}.{under}
+- If asked "which model" or "what AI are you", answer RoPac (local Ollama). Never claim GPT-4 or OpenAI.
+
+"""
+
+
 def build_system_prompt(
     user_query: str = "",
     *,
     attachment_context: str = "",
     has_chat_attachments: bool = False,
     attachment_paths: list[str] | None = None,
+    chat_provider: str = "local",
 ) -> str:
     from rag import format_rag_for_prompt, owner_profile_preamble, retrieve_all_context
 
     owner = _CONFIG.get("owner", "Rohit")
     base = f"""You are RoPac, a local AI assistant on {owner}'s computer.
 
+{_identity_prompt_block(chat_provider=chat_provider)}
 WHO IS CHATTING (critical):
 - Anyone may use this chat (guests, friends, colleagues). They are NOT automatically {owner}.
 - Do NOT call the person "{owner}" or "owner" unless they clearly say they are {owner}.
@@ -980,6 +999,7 @@ def _build_chat_messages(
         attachment_context=attachment_context,
         has_chat_attachments=bool(paths),
         attachment_paths=paths if use_attachment_rag else [],
+        chat_provider=chat_provider,
     )
     web_context = ""
     if use_internet:

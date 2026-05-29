@@ -16,6 +16,8 @@ CONFIG_PATH = ROPAC_ROOT / "config.json"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 
+VISION_MODEL = "moondream"
+
 _MIME = {
     "png": "image/png",
     "jpg": "image/jpeg",
@@ -32,7 +34,6 @@ def load_attachment_config() -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "chat_attachment_max_chars": 12000,
         "train_image_max_chars": 24000,
-        "vision_model": "moondream",
         "chat_attachments_enabled": True,
     }
     if not CONFIG_PATH.exists():
@@ -62,15 +63,9 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _describe_image_with_ollama(path: Path, *, for_training: bool = False) -> str:
-    from assistant import get_client, load_config
+    from assistant import get_client
 
-    cfg = {**load_config(), **load_attachment_config()}
-    model = str(cfg.get("vision_model") or "moondream").strip()
-    if not model:
-        raise ValueError(
-            "Image requires a vision model. Set vision_model in config.json "
-            "and run: ollama pull moondream"
-        )
+    model = VISION_MODEL
 
     if for_training:
         prompt = (

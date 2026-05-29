@@ -5,7 +5,6 @@
   "embeddings_enabled": true,
   "ollama_base_url": "http://localhost:11434/v1",
   "openai_base_url": "https://api.openai.com/v1",
-  "openai_model": "gpt-4o-mini",
   "coder_model": "qwen2.5-coder:latest",
   "owner": "Rohit",
   "assistant_name": "RoPac",
@@ -24,6 +23,5 @@
   "rag_min_memory_keyword_score": 0.08,
   "chat_attachments_enabled": true,
   "chat_attachment_max_chars": 12000,
-  "train_image_max_chars": 24000,
-  "vision_model": "moondream"
+  "train_image_max_chars": 24000
 }
