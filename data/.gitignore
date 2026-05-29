@@ -1,0 +1,7 @@
+memory.json
+chat_history.jsonl
+owner.auth
+knowledge/
+.vault_session/
+wrapped_key.json
+crypto.json

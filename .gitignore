@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+ropac.env
+
+# Large Ollama weights live in-repo when you copy the folder; skip from git
+ollama_models/blobs/
+ollama_models/manifests/
+!ollama_models/README.md
+
+data/tts/*.onnx
+data/tts/*.onnx.json
+data/tts/parler/
+data/tts/huggingface/
+data/tts/torch/
+data/tts/cache/
+data/tts/xdg_cache/
+!data/tts/README.md

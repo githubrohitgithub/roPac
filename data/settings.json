@@ -1,0 +1,7 @@
+{
+  "internet_enabled": true,
+  "speak_aloud_enabled": false,
+  "memory_suggestions_enabled": true,
+  "chat_provider": "local",
+  "tts_voice_lang": "hi"
+}

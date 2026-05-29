@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RoPac — How chat & RAG flow</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --surface: #1a2332;
+      --surface2: #243044;
+      --border: #3d4f66;
+      --text: #e8eef4;
+      --muted: #8ba3bc;
+      --accent: #4ecdc4;
+      --accent2: #7c6cf0;
+      --warm: #f4a261;
+      --ok: #6bcb77;
+      --skip: #5c6b7a;
+      --glow: rgba(78, 205, 196, 0.35);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+
+    header {
+      padding: 2rem 1.5rem 1rem;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, #152030 0%, var(--bg) 100%);
+    }
+
+    header h1 {
+      font-size: 1.6rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    header p {
+      color: var(--muted);
+      margin-top: 0.5rem;
+      max-width: 42rem;
+      margin-inline: auto;
+      font-size: 0.95rem;
+    }
+
+    .tabs {
+      display: flex;
+      justify-content: center;
+      gap: 0.75rem;
+      padding: 1.25rem 1rem;
+      flex-wrap: wrap;
+    }
+
+    .tabs button {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.65rem 1.25rem;
+      border-radius: 999px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: all 0.2s;
+    }
+
+    .tabs button:hover { border-color: var(--accent); color: var(--accent); }
+
+    .tabs button.active {
+      background: var(--accent);
+      color: #0a1218;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+
+    .controls {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 1rem;
+      padding-bottom: 1.5rem;
+      flex-wrap: wrap;
+    }
+
+    .controls button {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.5rem 1.2rem;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+
+    .controls button:hover { background: var(--border); }
+
+    .controls label {
+      color: var(--muted);
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 0 1rem 3rem;
+    }
+
+    .scenario-label {
+      text-align: center;
+      margin-bottom: 1rem;
+      padding: 0.75rem 1rem;
+      background: var(--surface);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+
+    .scenario-label strong { color: var(--warm); }
+
+    .flow { display: flex; flex-direction: column; align-items: center; gap: 0; }
+
+    .block {
+      width: 100%;
+      max-width: 520px;
+      background: var(--surface);
+      border: 2px solid var(--border);
+      border-radius: 14px;
+      padding: 1rem 1.15rem;
+      opacity: 0.35;
+      transform: translateY(8px) scale(0.98);
+      transition: opacity 0.45s ease, transform 0.45s ease, border-color 0.3s, box-shadow 0.3s;
+    }
+
+    .block.active {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+      border-color: var(--accent);
+      box-shadow: 0 0 24px var(--glow);
+    }
+
+    .block.done {
+      opacity: 0.85;
+      border-color: var(--ok);
+      transform: translateY(0) scale(1);
+    }
+
+    .block.skipped {
+      opacity: 0.5;
+      border-color: var(--skip);
+      border-style: dashed;
+    }
+
+    .block .title {
+      font-weight: 600;
+      font-size: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .block .badge {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      background: var(--surface2);
+      color: var(--muted);
+    }
+
+    .block.active .badge { background: var(--accent); color: #0a1218; }
+
+    .block .desc {
+      margin-top: 0.45rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+
+    .block .files {
+      margin-top: 0.5rem;
+      font-family ui-monospace, monospace;
+      font-size: 0.72rem;
+      color: var(--accent);
+    }
+
+    .block.rag-branch {
+      border-color: var(--accent2);
+      max-width: 560px;
+    }
+
+    .block.rag-branch.active { box-shadow: 0 0 24px rgba(124, 108, 240, 0.3); border-color: var(--accent2); }
+
+    .sub-blocks {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin-top: 0.65rem;
+      padding-left: 0.5rem;
+      border-left: 3px solid var(--accent2);
+    }
+
+    .sub-block {
+      background: var(--surface2);
+      border-radius: 8px;
+      padding: 0.5rem 0.65rem;
+      font-size: 0.78rem;
+      opacity: 0.3;
+      transition: opacity 0.35s, background 0.35s;
+    }
+
+    .sub-block.active {
+      opacity: 1;
+      background: #2d3a52;
+    }
+
+    .sub-block.done { opacity: 0.75; }
+
+    .arrow {
+      width: 2px;
+      height: 28px;
+      background: linear-gradient(180deg, var(--border), var(--accent));
+      position: relative;
+      opacity: 0.2;
+      transition: opacity 0.3s;
+    }
+
+    .arrow.live {
+      opacity: 1;
+      animation: pulse-line 0.8s ease infinite;
+    }
+
+    .arrow::after {
+      content: "";
+      position: absolute;
+      bottom: -4px;
+      left: 50%;
+      transform: translateX(-50%);
+      border: 6px solid transparent;
+      border-top-color: var(--accent);
+    }
+
+    @keyframes pulse-line {
+      0%, 100% { opacity: 0.5; }
+      50% { opacity: 1; }
+    }
+
+    .packet {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--accent);
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      opacity: 0;
+      box-shadow: 0 0 12px var(--accent);
+    }
+
+    .arrow-wrap {
+      position: relative;
+      height: 28px;
+      width: 100%;
+      display: flex;
+      justify-content: center;
+    }
+
+    .legend {
+      margin-top: 2rem;
+      padding: 1rem;
+      background: var(--surface);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .legend h3 { color: var(--text); font-size: 0.9rem; margin-bottom: 0.5rem; }
+
+    .legend ul { padding-left: 1.2rem; }
+
+    .legend li { margin: 0.35rem 0; }
+
+    .compare {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+
+    @media (max-width: 600px) {
+      .compare { grid-template-columns: 1fr; }
+    }
+
+    .compare-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      font-size: 0.82rem;
+    }
+
+    .compare-card h4 { font-size: 0.85rem; margin-bottom: 0.5rem; }
+
+    .compare-card.rag h4 { color: var(--accent2); }
+    .compare-card.normal h4 { color: var(--warm); }
+
+    footer {
+      text-align: center;
+      padding: 2rem;
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>RoPac chat flow</h1>
+    <p>Watch how your message moves through the app — with full RAG vs a simple “hi / what time is it” chat.</p>
+  </header>
+
+  <div class="tabs">
+    <button type="button" class="active" data-mode="rag">Full RAG question</button>
+    <button type="button" data-mode="normal">Normal chat (no RAG)</button>
+  </div>
+
+  <div class="controls">
+    <button type="button" id="btnPlay">▶ Play animation</button>
+    <button type="button" id="btnReset">↺ Reset</button>
+    <label><input type="checkbox" id="autoPlay" checked /> Auto-play on switch</label>
+  </div>
+
+  <main>
+    <div class="scenario-label" id="scenarioLabel"></div>
+    <div class="flow" id="flow"></div>
+
+    <div class="compare">
+      <div class="compare-card rag">
+        <h4>Full RAG example</h4>
+        “What stack did I say ShopMate uses?” — librarians search memory + trained docs + attachments.
+      </div>
+      <div class="compare-card normal">
+        <h4>Normal chat example</h4>
+        “Hi” or “What time is it now?” — no library search; small system prompt + history + LLM.
+      </div>
+    </div>
+
+    <div class="legend">
+      <h3>Real-life ↔ RoPac</h3>
+      <ul>
+        <li><strong>RoPac.app</strong> — you at the desk</li>
+        <li><strong>bridge.py</strong> — reception passes note to back office</li>
+        <li><strong>assistant.py</strong> — chief assistant assembles the briefing</li>
+        <li><strong>rag.py</strong> — three librarians (memory, filing cabinet, today’s attachments)</li>
+        <li><strong>Ollama / OpenAI</strong> — the brain that writes the reply</li>
+        <li><strong>Chat history</strong> — always included (both modes)</li>
+      </ul>
+    </div>
+  </main>
+
+  <footer>RoPac · docs/chat-flow-animation.html · Open in any browser</footer>
+
+  <script>
+    const SCENARIOS = {
+      rag: {
+        label: 'You ask: <strong>“What stack did I say ShopMate uses?”</strong> (saved fact + maybe trained docs)',
+        steps: [
+          { id: 'ui', title: 'RoPac.app (Flutter)', badge: 'UI', desc: 'You type and send. App adds message + session history + optional attachment paths.', files: 'ropac_ui → chat_screen.dart' },
+          { id: 'bridge', title: 'bridge.py', badge: 'Bridge', desc: 'JSON action chat_stream. One Python process handles this request.', files: 'action: chat_stream, history[], attachment_paths[]' },
+          { id: 'as', title: 'assistant.py', badge: 'Core', desc: 'chat_stream() → _build_chat_messages(). Checks save/delete commands first (not here).', files: 'assistant.py' },
+          { id: 'rag', title: 'retrieve_all_context (rag.py)', badge: 'RAG', desc: 'Librarians run in parallel for THIS question only.', files: '', sub: [
+            { id: 'mem', text: 'Memory — memory.json + memory.embeddings.json → top facts' },
+            { id: 'doc', text: 'Documents — data/knowledge/*.embeddings.json → top chunks' },
+            { id: 'att', text: 'Attachments — sessions/<hash>.json (if files attached)' },
+          ]},
+          { id: 'format', title: 'format_rag_for_prompt', badge: 'Prompt', desc: 'Builds RETRIEVED KNOWLEDGE block with [memory], [file#n] labels.', files: 'build_system_prompt()' },
+          { id: 'msgs', title: 'messages[]', badge: 'Packet', desc: 'system (rules + owner name + RAG block) + YOUR CHAT HISTORY + new user message', files: 'role: system | user | assistant …' },
+          { id: 'llm', title: 'Ollama or OpenAI', badge: 'LLM', desc: 'Model reads briefing and streams answer back through bridge → app.', files: 'gemma / roPac or gpt-4o-mini' },
+          { id: 'back', title: 'Reply on screen', badge: 'Done', desc: 'Flutter shows streaming text. Casual chat does NOT auto-save to memory.', files: '' },
+        ],
+      },
+      normal: {
+        label: 'You ask: <strong>“Hi — what time is it now?”</strong> (small talk, no library needed)',
+        steps: [
+          { id: 'ui', title: 'RoPac.app (Flutter)', badge: 'UI', desc: 'Same path: message + history sent to Python.', files: 'ropac_ui → chat_screen.dart' },
+          { id: 'bridge', title: 'bridge.py', badge: 'Bridge', desc: 'chat_stream delivered to assistant.', files: 'action: chat_stream' },
+          { id: 'as', title: 'assistant.py', badge: 'Core', desc: '_build_chat_messages() → build_system_prompt().', files: 'assistant.py' },
+          { id: 'rag-skip', title: 'retrieve_all_context — mostly empty', badge: 'Skip', desc: 'Trivial message (hi, thanks) → skip document search. No attachments → skip attachment RAG. Memory RAG may return nothing if no fact matches.', files: 'rag_skip_trivial_messages: true', skipped: true },
+          { id: 'format-skip', title: 'No RETRIEVED KNOWLEDGE block', badge: 'Light', desc: 'System prompt = rules + owner name only (“facts appear when retrieved”). No big memory dump (old behavior removed).', files: 'owner_profile_preamble()' },
+          { id: 'msgs', title: 'messages[]', badge: 'Packet', desc: 'Small system + full chat history + “what time is it now?” — model uses general knowledge + conversation.', files: 'No trained-doc chunks in prompt' },
+          { id: 'llm', title: 'Ollama or OpenAI', badge: 'LLM', desc: 'Answers from model weights + history. No filing cabinet opened.', files: '' },
+          { id: 'back', title: 'Reply on screen', badge: 'Done', desc: 'Fast, cheap prompt. Same pipeline, librarians stayed idle.', files: '' },
+        ],
+      },
+    };
+
+    let mode = 'rag';
+    let playing = false;
+    let stepIndex = 0;
+    let timer = null;
+
+    const flowEl = document.getElementById('flow');
+    const scenarioLabel = document.getElementById('scenarioLabel');
+    const btnPlay = document.getElementById('btnPlay');
+    const btnReset = document.getElementById('btnReset');
+    const autoPlay = document.getElementById('autoPlay');
+
+    function renderFlow() {
+      const s = SCENARIOS[mode];
+      scenarioLabel.innerHTML = s.label;
+      flowEl.innerHTML = '';
+
+      s.steps.forEach((step, i) => {
+        if (i > 0) {
+          const wrap = document.createElement('div');
+          wrap.className = 'arrow-wrap';
+          wrap.innerHTML = '<div class="arrow" data-arrow="' + i + '"></div>';
+          flowEl.appendChild(wrap);
+        }
+
+        const el = document.createElement('div');
+        el.className = 'block' + (step.skipped ? ' skipped' : '') + (step.id === 'rag' ? ' rag-branch' : '');
+        el.dataset.step = i;
+        el.innerHTML =
+          '<div class="title"><span class="badge">' + step.badge + '</span> ' + step.title + '</div>' +
+          '<div class="desc">' + step.desc + '</div>' +
+          (step.files ? '<div class="files">' + step.files + '</div>' : '');
+
+        if (step.sub) {
+          const sub = document.createElement('div');
+          sub.className = 'sub-blocks';
+          step.sub.forEach((sb, j) => {
+            const sbEl = document.createElement('div');
+            sbEl.className = 'sub-block';
+            sbEl.dataset.sub = i + '-' + j;
+            sbEl.textContent = sb.text;
+            sub.appendChild(sbEl);
+          });
+          el.appendChild(sub);
+        }
+        flowEl.appendChild(el);
+      });
+    }
+
+    function clearStates() {
+      flowEl.querySelectorAll('.block').forEach(b => {
+        b.classList.remove('active', 'done');
+      });
+      flowEl.querySelectorAll('.sub-block').forEach(b => {
+        b.classList.remove('active', 'done');
+      });
+      flowEl.querySelectorAll('.arrow').forEach(a => a.classList.remove('live'));
+    }
+
+    function activateStep(i) {
+      const blocks = flowEl.querySelectorAll('.block');
+      const arrows = flowEl.querySelectorAll('.arrow');
+
+      blocks.forEach((b, j) => {
+        b.classList.remove('active');
+        if (j < i) b.classList.add('done');
+        if (j === i) b.classList.add('active');
+      });
+
+      arrows.forEach((a, j) => {
+        a.classList.toggle('live', j < i);
+      });
+
+      const step = SCENARIOS[mode].steps[i];
+      if (step && step.sub) {
+        let subIdx = 0;
+        const subs = blocks[i].querySelectorAll('.sub-block');
+        const subTimer = setInterval(() => {
+          subs.forEach((s, k) => {
+            s.classList.remove('active');
+            if (k < subIdx) s.classList.add('done');
+            if (k === subIdx) s.classList.add('active');
+          });
+          subIdx++;
+          if (subIdx > subs.length) clearInterval(subTimer);
+        }, 380);
+      }
+    }
+
+    function play() {
+      if (playing) return;
+      playing = true;
+      btnPlay.disabled = true;
+      clearStates();
+      stepIndex = 0;
+      const total = SCENARIOS[mode].steps.length;
+
+      function tick() {
+        if (stepIndex >= total) {
+          playing = false;
+          btnPlay.disabled = false;
+          blocks = flowEl.querySelectorAll('.block');
+          blocks[blocks.length - 1].classList.remove('active');
+          blocks[blocks.length - 1].classList.add('done');
+          return;
+        }
+        activateStep(stepIndex);
+        const delay = SCENARIOS[mode].steps[stepIndex].id === 'rag' ? 1600 : 900;
+        stepIndex++;
+        timer = setTimeout(tick, delay);
+      }
+      tick();
+    }
+
+    function reset() {
+      clearTimeout(timer);
+      playing = false;
+      btnPlay.disabled = false;
+      stepIndex = 0;
+      clearStates();
+    }
+
+    document.querySelectorAll('.tabs button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        mode = btn.dataset.mode;
+        reset();
+        renderFlow();
+        if (autoPlay.checked) play();
+      });
+    });
+
+    btnPlay.addEventListener('click', () => { reset(); play(); });
+    btnReset.addEventListener('click', reset);
+
+    renderFlow();
+    setTimeout(() => play(), 400);
+  </script>
+</body>
+</html>
