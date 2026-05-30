@@ -7,3 +7,5 @@ piper-tts>=1.2.0
 onnxruntime>=1.16.0
 cryptography>=42.0.0
 keyring>=25.0.0
+faiss-cpu>=1.7.4
+numpy>=1.24.0

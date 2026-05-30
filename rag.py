@@ -1,5 +1,10 @@
 """
 Unified RAG: documents, owner memory facts, and chat attachments.
+
+FAISS is used for attachment chunk retrieval when available.  The
+faiss_index module wraps every FAISS call in try/except so a missing
+or broken faiss-cpu installation falls back transparently to the
+original O(N) cosine similarity loop — no change in behaviour.
 """
 
 from __future__ import annotations
@@ -44,6 +49,9 @@ def load_rag_config() -> dict[str, Any]:
         "rag_hybrid_keyword_weight": 0.35,
         "rag_min_memory_cosine_similarity": 0.22,
         "rag_min_memory_keyword_score": 0.08,
+        # FAISS: use IndexFlatIP for attachment chunk retrieval when available.
+        # Set false to always use the brute-force cosine loop (pure Python).
+        "rag_use_faiss": True,
     }
     return {**defaults, **{k: cfg[k] for k in cfg}}
 
@@ -277,6 +285,7 @@ def index_attachment_paths(
     cfg = load_rag_config()
     chunk_size = _rag_int(cfg, "rag_attachment_chunk_size", 1500)
     chunk_overlap = _rag_int(cfg, "rag_attachment_chunk_overlap", 200)
+    use_faiss = bool(cfg.get("rag_use_faiss", True))
 
     if not embeddings_enabled() or not paths:
         return False
@@ -287,6 +296,14 @@ def index_attachment_paths(
 
     existing = _read_store(path, owner_password=owner_password)
     if existing and existing.get("paths") == paths:
+        # Re-use cached store — but build FAISS index if it's missing and
+        # FAISS was requested (handles upgrade from pre-FAISS session cache).
+        if (
+            use_faiss
+            and not existing.get("faiss_index_b64")
+            and existing.get("vectors")
+        ):
+            _attach_faiss_index_to_store(existing, path, owner_password=owner_password)
         return True
 
     chunks: list[str] = []
@@ -316,7 +333,7 @@ def index_attachment_paths(
     except Exception:
         return False
 
-    payload = {
+    payload: dict[str, Any] = {
         "session_key": session_key,
         "paths": list(paths),
         "embed_model": embed_model_name(),
@@ -325,8 +342,51 @@ def index_attachment_paths(
         "vectors": vectors,
         "indexed_at": _utc_now(),
     }
+
+    # --- Build and serialise FAISS index (attachment-only optimisation) ---
+    if use_faiss:
+        from faiss_index import build_flat_index, faiss_available, serialize_index
+
+        if faiss_available():
+            faiss_idx = build_flat_index(vectors)
+            if faiss_idx is not None:
+                b64 = serialize_index(faiss_idx)
+                if b64:
+                    payload["faiss_index_b64"] = b64
+
     _write_store(path, payload, owner_password=owner_password)
     return True
+
+
+def _attach_faiss_index_to_store(
+    store: dict[str, Any],
+    store_path: Path,
+    *,
+    owner_password: str | None = None,
+) -> None:
+    """
+    Retroactively build and persist a FAISS index into an existing session
+    store that was created before FAISS support was added.
+    Called only when rag_use_faiss=True and faiss_index_b64 is missing.
+    """
+    from faiss_index import build_flat_index, faiss_available, serialize_index
+
+    if not faiss_available():
+        return
+    vectors = store.get("vectors") or []
+    if not vectors:
+        return
+    faiss_idx = build_flat_index(vectors)
+    if faiss_idx is None:
+        return
+    b64 = serialize_index(faiss_idx)
+    if not b64:
+        return
+    store["faiss_index_b64"] = b64
+    try:
+        _write_store(store_path, store, owner_password=owner_password)
+    except Exception:
+        pass
 
 
 def retrieve_attachment_context(
@@ -349,6 +409,7 @@ def retrieve_attachment_context(
 
     k = top_k if top_k is not None else _rag_int(cfg, "rag_top_attachment_chunks", 8)
     cite = bool(cfg.get("rag_chunk_citations", True))
+    use_faiss = bool(cfg.get("rag_use_faiss", True))
 
     if not index_attachment_paths(paths, owner_password=owner_password):
         return ""
@@ -365,24 +426,39 @@ def retrieve_attachment_context(
         return ""
 
     hits: list[RagHit] = []
-    if embeddings_enabled() and len(vectors) == len(chunks):
+
+    # --- FAISS path: fast ANN search on attachment chunks ---
+    if use_faiss and embeddings_enabled() and store.get("faiss_index_b64"):
+        from faiss_index import deserialize_index, faiss_available, search_index
+
+        if faiss_available():
+            try:
+                qvec = embed_query(q)
+                faiss_idx = deserialize_index(store["faiss_index_b64"])
+                if faiss_idx is not None:
+                    # Retrieve a generous candidate pool then let score-floor filter
+                    candidate_k = min(k * 4, len(chunks))
+                    scores, idxs = search_index(faiss_idx, qvec, candidate_k)
+                    for score, i in zip(scores, idxs):
+                        if i < len(chunks):
+                            label = labels[i] if i < len(labels) else "attachment"
+                            hits.append(RagHit(score, f"{label} — attachment", chunks[i], i))
+            except Exception:
+                hits = []  # fall through to cosine loop
+
+    # --- Cosine fallback: O(N) brute-force (also used when FAISS unavailable) ---
+    if not hits and embeddings_enabled() and len(vectors) == len(chunks):
         try:
             qvec = embed_query(q)
             for i, (vec, ch) in enumerate(zip(vectors, chunks)):
                 label = labels[i] if i < len(labels) else "attachment"
                 score = cosine_similarity(qvec, vec)
                 if score > 0:
-                    hits.append(
-                        RagHit(
-                            score,
-                            f"{label} — attachment",
-                            ch,
-                            i,
-                        )
-                    )
+                    hits.append(RagHit(score, f"{label} — attachment", ch, i))
         except Exception:
             hits = []
 
+    # --- Keyword fallback: pure token overlap (no Ollama needed) ---
     if not hits:
         tokens = _tokenize(q)
         for i, ch in enumerate(chunks):
@@ -423,9 +499,12 @@ def retrieve_attachment_hybrid(
     """
     Hybrid vector + keyword retrieval with per-file minimum coverage.
     Ensures all uploaded files contribute chunks, not only the top global matches.
+
+    When FAISS is available (rag_use_faiss=True), the vector similarity
+    component is computed via IndexFlatIP instead of the O(N) cosine loop.
+    Keyword blending and per-file coverage guarantees are unchanged.
     """
     from chat_attachments import resolve_attachment_char_budgets
-    from knowledge import _is_trivial_message, _tokenize
     from embeddings import cosine_similarity, embed_query, embeddings_enabled
     from knowledge import _is_trivial_message, _score_chunk, _tokenize
 
@@ -435,6 +514,8 @@ def retrieve_attachment_hybrid(
     q = query.strip()
     if not q or _is_trivial_message(q):
         return ""
+
+    use_faiss = bool(cfg.get("rag_use_faiss", True))
 
     if not index_attachment_paths(paths, owner_password=owner_password):
         return ""
@@ -453,10 +534,9 @@ def retrieve_attachment_hybrid(
     kw_weight = _rag_float(cfg, "rag_hybrid_keyword_weight", 0.35)
     min_per_file = _rag_int(cfg, "rag_attachment_min_chunks_per_file", 4)
     max_chunks = _rag_int(cfg, "rag_attachment_max_chunks", 64)
-    if len(_tokenize(q)) >= 4:
+    tokens = _tokenize(q)
+    if len(tokens) >= 4:
         max_chunks = max(max_chunks, min(len(chunks), 120))
-
-    from chat_attachments import resolve_attachment_char_budgets
 
     char_limit = max_chars
     if char_limit is None:
@@ -464,10 +544,52 @@ def retrieve_attachment_hybrid(
 
     cite = bool(cfg.get("rag_chunk_citations", True))
     min_cos = _rag_float(cfg, "rag_min_cosine_similarity", 0.28)
-    tokens = _tokenize(q)
 
     hits: list[RagHit] = []
-    if embeddings_enabled() and len(vectors) == len(chunks):
+
+    # ----------------------------------------------------------------
+    # FAISS-accelerated hybrid path
+    # ----------------------------------------------------------------
+    # Strategy: use FAISS to retrieve a large candidate pool (up to
+    # max_chunks * 3 or all chunks, whichever is smaller) for the
+    # vector component, then blend each candidate's cosine score with
+    # its keyword score exactly as the original loop does.
+    # Chunks not in the FAISS pool are still considered for keyword
+    # matching so per-file coverage stays guaranteed.
+    # ----------------------------------------------------------------
+    if use_faiss and embeddings_enabled() and store.get("faiss_index_b64"):
+        from faiss_index import deserialize_index, faiss_available, search_index
+
+        if faiss_available():
+            try:
+                qvec = embed_query(q)
+                faiss_idx = deserialize_index(store["faiss_index_b64"])
+                if faiss_idx is not None:
+                    # Retrieve a generous candidate pool for blending.
+                    candidate_k = min(max_chunks * 3, len(chunks))
+                    faiss_scores, faiss_idxs = search_index(faiss_idx, qvec, candidate_k)
+
+                    # Build a score map: chunk_index -> cosine score from FAISS
+                    faiss_cos: dict[int, float] = {}
+                    for cos_score, idx in zip(faiss_scores, faiss_idxs):
+                        if idx < len(chunks):
+                            faiss_cos[idx] = cos_score
+
+                    # Blend FAISS cosine with keyword score for every chunk
+                    for i, ch in enumerate(chunks):
+                        label = labels[i] if i < len(labels) else "attachment"
+                        cos = faiss_cos.get(i, 0.0)
+                        kw = _score_chunk(tokens, ch)
+                        score = _blend_attachment_score(cos, kw, keyword_weight=kw_weight)
+                        if score > 0:
+                            hits.append(RagHit(score, f"{label} — attachment", ch, i))
+            except Exception:
+                hits = []  # fall through to cosine loop
+
+    # ----------------------------------------------------------------
+    # Cosine loop fallback (FAISS unavailable / disabled / failed)
+    # ----------------------------------------------------------------
+    if not hits and embeddings_enabled() and len(vectors) == len(chunks):
         try:
             qvec = embed_query(q)
             for i, (vec, ch) in enumerate(zip(vectors, chunks)):
@@ -476,12 +598,13 @@ def retrieve_attachment_hybrid(
                 kw = _score_chunk(tokens, ch)
                 score = _blend_attachment_score(cos, kw, keyword_weight=kw_weight)
                 if score > 0:
-                    hits.append(
-                        RagHit(score, f"{label} — attachment", ch, i)
-                    )
+                    hits.append(RagHit(score, f"{label} — attachment", ch, i))
         except Exception:
             hits = []
 
+    # ----------------------------------------------------------------
+    # Pure keyword fallback (no Ollama / embeddings)
+    # ----------------------------------------------------------------
     if not hits:
         for i, ch in enumerate(chunks):
             label = labels[i] if i < len(labels) else "attachment"
@@ -500,6 +623,7 @@ def retrieve_attachment_hybrid(
     selected: list[RagHit] = []
     picked: set[int] = set()
 
+    # Guarantee minimum coverage per file (round-robin first N rounds)
     for _round in range(min_per_file):
         for file_hits in by_file.values():
             if _round >= len(file_hits):
@@ -510,6 +634,7 @@ def retrieve_attachment_hybrid(
             selected.append(hit)
             picked.add(hit.chunk_index)
 
+    # Fill remaining slots up to max_chunks
     for hit in hits:
         if len(selected) >= max_chunks:
             break
