@@ -4,6 +4,7 @@ class ChatMessage {
     required this.content,
     this.rawContent,
     this.isStreaming = false,
+    this.ragMetadata,
   });
 
   final String role;
@@ -18,6 +19,9 @@ class ChatMessage {
 
   /// True while the assistant reply is still being generated.
   final bool isStreaming;
+
+  /// Structured RAG query metadata from the backend
+  final Map<String, dynamic>? ragMetadata;
 
   bool get isUser => role == 'user';
 

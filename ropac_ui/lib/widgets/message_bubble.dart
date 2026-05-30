@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/chat_message.dart';
 import '../theme/ropac_theme.dart';
 import 'typing_indicator.dart';
+import 'knowledge_graph.dart';
 
 class MessageBubble extends StatelessWidget {
   const MessageBubble({
@@ -80,6 +81,13 @@ class MessageBubble extends StatelessWidget {
                   ),
                   child: _BubbleBody(message: message, isUser: isUser),
                 ),
+                if (!isUser &&
+                    message.ragMetadata != null &&
+                    message.ragMetadata!['nodes'] != null &&
+                    (message.ragMetadata!['nodes'] as List).isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  KnowledgeGraphWidget(ragMetadata: message.ragMetadata!),
+                ],
                 if (onEdit != null) ...[
                   const SizedBox(height: 4),
                   TextButton.icon(

@@ -92,6 +92,7 @@ class RagHit:
     chunk_index: int
     # Populated by _detect_conflicts — label of the conflicting source, if any
     conflict_with: str = ""
+    cosine_score: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +435,9 @@ def retrieve_memory_context(
 
 
 def _attachment_session_key(paths: list[str]) -> str:
-    parts: list[str] = []
+    from embeddings import embed_model_name
+
+    parts: list[str] = [embed_model_name()]
     for raw in sorted(paths):
         p = Path(raw).expanduser()
         try:
@@ -765,7 +768,7 @@ def retrieve_attachment_hybrid(
                         kw = _score_chunk(tokens, ch)
                         score = _blend_attachment_score(cos, kw, keyword_weight=kw_weight)
                         if score > 0:
-                            hits.append(RagHit(score, f"{label} — attachment", ch, i))
+                            hits.append(RagHit(score, f"{label} — attachment", ch, i, cosine_score=cos))
             except Exception:
                 hits = []  # fall through to cosine loop
 
@@ -781,7 +784,7 @@ def retrieve_attachment_hybrid(
                 kw = _score_chunk(tokens, ch)
                 score = _blend_attachment_score(cos, kw, keyword_weight=kw_weight)
                 if score > 0:
-                    hits.append(RagHit(score, f"{label} — attachment", ch, i))
+                    hits.append(RagHit(score, f"{label} — attachment", ch, i, cosine_score=cos))
         except Exception:
             hits = []
 
@@ -793,7 +796,7 @@ def retrieve_attachment_hybrid(
             label = labels[i] if i < len(labels) else "attachment"
             kw = _score_chunk(tokens, ch)
             if kw > 0:
-                hits.append(RagHit(kw, f"{label} — attachment", ch, i))
+                hits.append(RagHit(kw, f"{label} — attachment", ch, i, cosine_score=0.0))
 
     if not hits:
         return ""
@@ -823,8 +826,18 @@ def retrieve_attachment_hybrid(
             break
         if hit.chunk_index in picked:
             continue
-        if hit.score < min_cos and len(selected) >= min_per_file * max(len(by_file), 1):
-            continue
+            
+        # Check pure cosine score component when embeddings are used, otherwise check blended score
+        is_embedded = embeddings_enabled() and len(vectors) == len(chunks)
+        has_cosine = hit.cosine_score > 0.0
+        
+        if is_embedded and has_cosine:
+            if hit.cosine_score < min_cos and len(selected) >= min_per_file * max(len(by_file), 1):
+                continue
+        elif len(selected) >= min_per_file * max(len(by_file), 1):
+            if hit.score < 0.05:
+                continue
+                
         selected.append(hit)
         picked.add(hit.chunk_index)
 
@@ -990,6 +1003,73 @@ def retrieve_attachment_all_chunks(
     )
 
 
+_SYNONYMS = {
+    "refund": ["reimbursement", "return", "refunds", "refunded", "chargeback"],
+    "refunds": ["reimbursement", "return", "refund", "refunded", "chargeback"],
+    "reimbursement": ["refund", "reimbursements", "expense", "payback"],
+    "reimbursements": ["refund", "reimbursement", "expense", "payback"],
+    "payment": ["payments", "paid", "transaction", "invoice", "receipt", "billing"],
+    "payments": ["payment", "paid", "transaction", "invoice", "receipt", "billing"],
+    "price": ["cost", "charge", "rate", "fee", "pricing"],
+    "cost": ["price", "charge", "rate", "fee", "pricing"],
+    "charge": ["price", "cost", "rate", "fee", "billing"],
+    "invoice": ["bill", "invoices", "receipt", "payment"],
+    "invoices": ["bill", "invoice", "receipt", "payment"],
+    "receipt": ["invoice", "bill", "payment", "proof"],
+    "receipts": ["invoice", "bill", "payment", "proof"],
+    "error": ["errors", "fail", "failed", "failure", "bug", "crash", "exception"],
+    "errors": ["error", "fail", "failed", "failure", "bug", "crash", "exception"],
+    "fail": ["failed", "failure", "error", "bug", "crash"],
+    "failed": ["fail", "failure", "error", "bug", "crash"],
+    "failure": ["fail", "failed", "error", "bug", "crash"],
+    "bug": ["error", "fail", "failed", "issue", "defect"],
+    "bugs": ["error", "fail", "failed", "issue", "defect"],
+    "issue": ["bug", "error", "problem", "defect"],
+    "issues": ["bug", "error", "problem", "defect"],
+    "order": ["orders", "purchase", "transaction", "cart"],
+    "orders": ["order", "purchase", "transaction", "cart"],
+    "purchase": ["order", "buy", "transaction"],
+    "food": ["meal", "order", "foodname", "dish", "menu"],
+    "meal": ["food", "order", "dish", "menu"],
+    "salary": ["pay", "wage", "income", "compensation"],
+    "pay": ["salary", "wage", "income", "compensation"],
+    "wage": ["salary", "pay", "income", "compensation"],
+    "income": ["salary", "pay", "wage", "compensation"],
+    "address": ["location", "place", "street", "residence"],
+    "location": ["address", "place", "street", "residence"],
+    "phone": ["mobile", "cell", "contact", "number", "telephone"],
+    "mobile": ["phone", "cell", "contact", "number", "telephone"],
+    "contact": ["phone", "mobile", "email", "address", "number"],
+    "email": ["mail", "contact", "message"],
+    "mail": ["email", "contact", "message"],
+}
+
+
+def _expand_query(query: str) -> str:
+    """Expand short/vague queries with common synonyms to improve RAG recall."""
+    from knowledge import _tokenize
+
+    q = query.strip()
+    if not q:
+        return q
+
+    words = _tokenize(q)
+    expanded = list(words)
+    for word in words:
+        low = word.lower()
+        if low in _SYNONYMS:
+            for syn in _SYNONYMS[low]:
+                if syn not in expanded:
+                    expanded.append(syn)
+
+    if len(expanded) > len(words):
+        # Append unique synonyms to preserve the query's natural sentence embedding
+        # but enrich it with key terminology.
+        new_terms = [w for w in expanded if w not in words]
+        return q + " " + " ".join(new_terms)
+    return q
+
+
 # --- Unified retrieval ---
 
 
@@ -1007,17 +1087,23 @@ def retrieve_attachment_for_query(
     from chat_attachments import grep_session_for_query, resolve_attachment_char_budgets
     from knowledge import _is_trivial_message
 
-    q = query.strip()
+    q = _expand_query(query.strip())
     if not q or _is_trivial_message(q) or not paths:
         return ""
 
     _full, limit = resolve_attachment_char_budgets()
     budget = max_chars if max_chars is not None else limit
-    grep_part = grep_session_for_query(paths, q, max_chars=max(budget // 2, 4000))
+
+    # Guarantee a minimum budget of 2000 chars for hybrid/FAISS (or less if the total budget is tiny)
+    min_hybrid = min(2000, budget // 2)
+    target_hybrid = max(min_hybrid, budget // 2)
+    target_grep = max(0, budget - target_hybrid)
+
+    grep_part = grep_session_for_query(paths, q, max_chars=target_grep)
     used = len(grep_part)
     remaining = max(budget - used - 4, 0)
     hybrid_part = ""
-    if remaining > 800:
+    if remaining >= 800:
         hybrid_part = retrieve_attachment_hybrid(
             q, paths, owner_password=owner_password, max_chars=remaining
         )
@@ -1054,7 +1140,11 @@ def retrieve_all_context(
 
     if (
         query.strip()
-        and should_run_document_retrieval(query, has_chat_attachments=has_attachments)
+        and should_run_document_retrieval(
+            query,
+            has_chat_attachments=has_attachments,
+            attachment_paths=paths,
+        )
     ):
         docs = retrieve_context(query)
         if docs.strip():
@@ -1064,13 +1154,21 @@ def retrieve_all_context(
         from knowledge import _is_trivial_message
 
         needs_search = bool(query.strip()) and not _is_trivial_message(query)
-        # Full inline mode: every byte is already in SESSION ATTACHMENTS — skip RAG.
-        if session_attachment_mode != "full" and needs_search:
-            att = retrieve_attachment_for_query(
-                query, paths, owner_password=owner_password
-            )
-            if att.strip():
-                sections["attachments"] = att.strip()
+        if needs_search:
+            if session_attachment_mode == "full":
+                # For full mode, retrieve a smaller set of highly relevant excerpts (e.g. top-k chunks)
+                # to prepend above the full text, so the model sees the best matches first.
+                att = retrieve_attachment_for_query(
+                    query, paths, owner_password=owner_password, max_chars=8000
+                )
+                if att.strip():
+                    sections["attachments"] = "HIGH-RELEVANCE EXCERPTS FROM ATTACHED FILES:\n" + att.strip()
+            else:
+                att = retrieve_attachment_for_query(
+                    query, paths, owner_password=owner_password
+                )
+                if att.strip():
+                    sections["attachments"] = att.strip()
 
     return sections
 
@@ -1127,3 +1225,221 @@ def owner_profile_preamble() -> str:
         f"Machine owner (built RoPac): {owner}\n"
         "Owner-specific facts appear below only when retrieved for this question."
     )
+
+
+def retrieve_rag_metadata(
+    query: str,
+    *,
+    attachment_paths: list[str] | None = None,
+    has_chat_attachments: bool = False,
+    owner_password: str | None = None,
+) -> dict[str, Any]:
+    """
+    Retrieves RAG hits in a structured format suitable for building a retrieved knowledge graph.
+    """
+    from knowledge import should_run_document_retrieval, list_documents, _load_document_payload, load_embeddings, ensure_document_embeddings
+    from embeddings import cosine_similarity, embed_query, embeddings_enabled, embed_model_name
+    from assistant import load_memory
+    
+    cfg = load_rag_config()
+    q = query.strip()
+    if not q:
+        return {"nodes": [], "conflicts": []}
+
+    nodes = []
+    paths = [str(p).strip() for p in (attachment_paths or []) if str(p).strip()]
+    has_attachments = has_chat_attachments or bool(paths)
+    
+    # 1. Memory facts
+    if cfg.get("rag_memory_enabled", True) and not has_attachments:
+        try:
+            memory = load_memory(password=owner_password)
+            facts = [str(f).strip() for f in memory.get("facts", []) if str(f).strip()]
+            if facts and embeddings_enabled():
+                ensure_memory_embeddings(owner_password=owner_password)
+                emb = _read_store(MEMORY_EMBED_PATH, owner_password=owner_password)
+                if emb and emb.get("chunks") == facts:
+                    qvec = embed_query(q)
+                    vectors = emb.get("vectors") or []
+                    hits = []
+                    for i, (vec, fact) in enumerate(zip(vectors, facts)):
+                        score = cosine_similarity(qvec, vec)
+                        if score > 0:
+                            hits.append(RagHit(score, "memory", fact, i))
+                    
+                    min_cos = _rag_float(cfg, "rag_min_memory_cosine_similarity", 0.22)
+                    hits = [h for h in hits if h.score >= min_cos]
+                    hits.sort(key=lambda h: h.score, reverse=True)
+                    for idx, h in enumerate(hits[:6]):
+                        nodes.append({
+                            "id": f"memory_{idx}",
+                            "type": "memory",
+                            "source": "Memory",
+                            "text": h.text,
+                            "score": float(round(h.score, 3)),
+                            "conflict_with": ""
+                        })
+        except Exception:
+            pass
+
+    # 2. Trained documents
+    if should_run_document_retrieval(q, has_chat_attachments=has_attachments, attachment_paths=paths):
+        try:
+            if embeddings_enabled():
+                min_cos = _rag_float(cfg, "rag_min_cosine_similarity", 0.28)
+                query_vec = embed_query(q)
+                model = embed_model_name()
+                doc_hits = []
+                for doc in list_documents():
+                    doc_id = str(doc.get("id") or "")
+                    payload = _load_document_payload(doc_id)
+                    if not payload:
+                        continue
+                    chunks = payload.get("chunks") or []
+                    if not chunks or not ensure_document_embeddings(doc_id, chunks):
+                        continue
+                    emb = load_embeddings(doc_id)
+                    if not emb or emb.get("embed_model") != model:
+                        continue
+                    vectors = emb.get("vectors") or []
+                    source = payload.get("source_name", doc.get("source_name", "document"))
+                    for chunk_i, (vec, chunk) in enumerate(zip(vectors, chunks)):
+                        score = cosine_similarity(query_vec, vec)
+                        if score >= min_cos:
+                            doc_hits.append((score, source, chunk, chunk_i))
+                doc_hits.sort(key=lambda x: x[0], reverse=True)
+                for idx, (score, source, chunk, chunk_i) in enumerate(doc_hits[:6]):
+                    nodes.append({
+                        "id": f"document_{idx}",
+                        "type": "document",
+                        "source": source,
+                        "text": chunk,
+                        "score": float(round(score, 3)),
+                        "conflict_with": ""
+                    })
+        except Exception:
+            pass
+
+    # 3. Attachments
+    if has_attachments and cfg.get("rag_attachment_rag_enabled", True):
+        try:
+            if paths:
+                if index_attachment_paths(paths, owner_password=owner_password):
+                    session_key = _attachment_session_key(paths)
+                    store = _read_store(_session_path(session_key), owner_password=owner_password)
+                    if store:
+                        chunks = store.get("chunks") or []
+                        labels = store.get("labels") or []
+                        vectors = store.get("vectors") or []
+                        if chunks:
+                            from chat_attachments import query_search_terms
+                            from knowledge import _score_chunk, _tokenize
+                            kw_weight = _rag_float(cfg, "rag_hybrid_keyword_weight", 0.35)
+                            min_per_file = _rag_int(cfg, "rag_attachment_min_chunks_per_file", 4)
+                            max_chunks = _rag_int(cfg, "rag_attachment_max_chunks", 64)
+                            min_cos = _rag_float(cfg, "rag_min_cosine_similarity", 0.28)
+                            tokens = _tokenize(q)
+                            use_faiss = bool(cfg.get("rag_use_faiss", True))
+                            
+                            hits = []
+                            if use_faiss and embeddings_enabled() and store.get("faiss_index_b64"):
+                                from faiss_index import deserialize_index, faiss_available, search_index
+                                if faiss_available():
+                                    qvec = embed_query(q)
+                                    faiss_idx = deserialize_index(store["faiss_index_b64"])
+                                    if faiss_idx is not None:
+                                        candidate_k = min(max_chunks * 3, len(chunks))
+                                        faiss_scores, faiss_idxs = search_index(faiss_idx, qvec, candidate_k)
+                                        faiss_cos = {idx: cs for cs, idx in zip(faiss_scores, faiss_idxs) if idx < len(chunks)}
+                                        for i, ch in enumerate(chunks):
+                                            label = labels[i] if i < len(labels) else "attachment"
+                                            cos = faiss_cos.get(i, 0.0)
+                                            kw = _score_chunk(tokens, ch)
+                                            score = _blend_attachment_score(cos, kw, keyword_weight=kw_weight)
+                                            if score > 0:
+                                                hits.append(RagHit(score, f"{label} — attachment", ch, i, cosine_score=cos))
+                            
+                            if not hits and embeddings_enabled() and len(vectors) == len(chunks):
+                                qvec = embed_query(q)
+                                for i, (vec, ch) in enumerate(zip(vectors, chunks)):
+                                    label = labels[i] if i < len(labels) else "attachment"
+                                    cos = cosine_similarity(qvec, vec)
+                                    kw = _score_chunk(tokens, ch)
+                                    score = _blend_attachment_score(cos, kw, keyword_weight=kw_weight)
+                                    if score > 0:
+                                        hits.append(RagHit(score, f"{label} — attachment", ch, i, cosine_score=cos))
+                                        
+                            if not hits:
+                                for i, ch in enumerate(chunks):
+                                    label = labels[i] if i < len(labels) else "attachment"
+                                    kw = _score_chunk(tokens, ch)
+                                    if kw > 0:
+                                        hits.append(RagHit(kw, f"{label} — attachment", ch, i, cosine_score=0.0))
+                                        
+                            if hits:
+                                hits.sort(key=lambda h: h.score, reverse=True)
+                                by_file = {}
+                                for h in hits:
+                                    by_file.setdefault(_attachment_file_label(h), []).append(h)
+                                
+                                selected = []
+                                picked = set()
+                                for _round in range(min_per_file):
+                                    for file_hits in by_file.values():
+                                        if _round < len(file_hits):
+                                            h = file_hits[_round]
+                                            if h.chunk_index not in picked:
+                                                selected.append(h)
+                                                picked.add(h.chunk_index)
+                                                
+                                for h in hits:
+                                    if len(selected) >= max_chunks:
+                                        break
+                                    if h.chunk_index in picked:
+                                        continue
+                                    is_embedded = embeddings_enabled() and len(vectors) == len(chunks)
+                                    has_cosine = h.cosine_score > 0.0
+                                    if is_embedded and has_cosine:
+                                        if h.cosine_score < min_cos and len(selected) >= min_per_file * max(len(by_file), 1):
+                                            continue
+                                    elif len(selected) >= min_per_file * max(len(by_file), 1):
+                                        if h.score < 0.05:
+                                            continue
+                                    selected.append(h)
+                                    picked.add(h.chunk_index)
+                                
+                                selected.sort(key=lambda h: h.score, reverse=True)
+                                vec_map = None
+                                if vectors and len(vectors) == len(chunks):
+                                    vec_map = {i: vectors[i] for i in range(len(vectors))}
+                                selected = _detect_conflicts(
+                                    selected, vec_map,
+                                    low=_rag_float(cfg, "rag_conflict_sim_low", 0.75),
+                                    high=_rag_float(cfg, "rag_conflict_sim_high", 0.92)
+                                )
+                                
+                                for idx, h in enumerate(selected[:12]):
+                                    nodes.append({
+                                        "id": f"attachment_{idx}",
+                                        "type": "attachment",
+                                        "source": _attachment_file_label(h),
+                                        "text": h.text,
+                                        "score": float(round(h.score, 3)),
+                                        "conflict_with": h.conflict_with
+                                    })
+        except Exception:
+            pass
+
+    conflicts = []
+    for n1 in nodes:
+        if n1.get("conflict_with"):
+            for n2 in nodes:
+                if n2["id"] != n1["id"] and n2["source"].lower() == n1["conflict_with"].lower():
+                    conflicts.append({
+                        "node_id_1": n1["id"],
+                        "node_id_2": n2["id"],
+                        "reason": f"Discrepancy between {n1['source']} and {n2['source']}"
+                    })
+                    break
+
+    return {"nodes": nodes, "conflicts": conflicts}

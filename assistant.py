@@ -616,7 +616,7 @@ OWNER PROFILE (not the current user unless they say so):
     # already in rag_text. If effective_mode is "full", the complete text is
     # already in rag_text via build_query_attachment_context; adding it again
     # would double the token count and push real content out of the context window.
-    if attachment_context.strip() and effective_mode != "full":
+    if attachment_context.strip():
         ctx = attachment_context.strip()
         if ctx not in base:
             base += f"""

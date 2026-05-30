@@ -22,10 +22,12 @@ class ChatStreamResult {
   const ChatStreamResult({
     required this.reply,
     this.memorySuggestions = const [],
+    this.ragMetadata,
   });
 
   final String reply;
   final List<String> memorySuggestions;
+  final Map<String, dynamic>? ragMetadata;
 }
 
 /// Talks to RoPac via local Python subprocess only — no HTTP, no cloud.
@@ -265,6 +267,7 @@ class RopacLocal {
     final buffer = StringBuffer();
     String? finalReply;
     var memorySuggestions = <String>[];
+    Map<String, dynamic>? ragMetadata;
 
     try {
       await for (final line
@@ -299,6 +302,9 @@ class RopacLocal {
           if (fromOk is List && fromOk.isNotEmpty) {
             memorySuggestions = fromOk.map((e) => e.toString()).toList();
           }
+          if (data['rag_metadata'] != null) {
+            ragMetadata = Map<String, dynamic>.from(data['rag_metadata'] as Map);
+          }
         }
       }
 
@@ -317,6 +323,7 @@ class RopacLocal {
     return ChatStreamResult(
       reply: finalReply ?? buffer.toString(),
       memorySuggestions: memorySuggestions,
+      ragMetadata: ragMetadata,
     );
   }
 

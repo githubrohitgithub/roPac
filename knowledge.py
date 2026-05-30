@@ -114,13 +114,14 @@ def _is_trivial_message(text: str) -> bool:
 
 
 def should_run_document_retrieval(
-    user_query: str, *, has_chat_attachments: bool = False
+    user_query: str,
+    *,
+    has_chat_attachments: bool = False,
+    attachment_paths: list[str] | None = None,
 ) -> bool:
     """
     When False, skip retrieve_context (saves Ollama embed call + chunk scan).
     """
-    if has_chat_attachments:
-        return False
     cfg = load_rag_config()
     if not cfg.get("rag_retrieval_enabled", True):
         return False
@@ -131,6 +132,25 @@ def should_run_document_retrieval(
         return False
     if cfg.get("rag_skip_trivial_messages", True) and _is_trivial_message(q):
         return False
+
+    if has_chat_attachments:
+        if attachment_paths:
+            # Check if query matches attachments. If so, suppress document RAG.
+            from chat_attachments import query_search_terms, read_session_files
+            phrases, tokens = query_search_terms(q)
+            if phrases or tokens:
+                files = read_session_files(attachment_paths)
+                has_grep_hit = False
+                for name, text, _kind in files:
+                    lower_text = text.lower()
+                    if any(p.lower() in lower_text for p in phrases) or any(t in lower_text for t in tokens):
+                        has_grep_hit = True
+                        break
+                if has_grep_hit:
+                    return False
+        else:
+            return False
+
     return True
 
 TRAIN_SUMMARY_PROMPT = """You read a document for a personal AI knowledge base.

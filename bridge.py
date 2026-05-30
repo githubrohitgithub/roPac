@@ -561,6 +561,13 @@ def _handle(req: dict[str, Any]) -> None:
             ok, vault_msg = require_unlocked_session(password=None)
             if not ok:
                 _err(f"VAULT_LOCKED: {vault_msg}")
+        from rag import retrieve_rag_metadata
+        rag_meta = retrieve_rag_metadata(
+            message,
+            attachment_paths=attachment_paths,
+            has_chat_attachments=bool(attachment_paths),
+            owner_password=password,
+        )
         reply, _, _ = chat(
             message,
             history=history,
@@ -571,7 +578,7 @@ def _handle(req: dict[str, Any]) -> None:
             openai_api_key_override=openai_key,
             attachment_paths=attachment_paths,
         )
-        _ok({"reply": reply})
+        _ok({"reply": reply, "rag_metadata": rag_meta})
         return
 
     if action == "save_memory_suggestions":
@@ -658,11 +665,19 @@ def _handle(req: dict[str, Any]) -> None:
                         "facts": suggestions,
                     }
                 )
+            from rag import retrieve_rag_metadata
+            rag_meta = retrieve_rag_metadata(
+                message,
+                attachment_paths=attachment_paths,
+                has_chat_attachments=bool(attachment_paths),
+                owner_password=password,
+            )
             _stream_event(
                 {
                     "ok": True,
                     "reply": "".join(parts),
                     "memory_suggestions": suggestions,
+                    "rag_metadata": rag_meta,
                 }
             )
         except Exception as e:

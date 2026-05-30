@@ -781,6 +781,7 @@ class _ChatScreenState extends State<ChatScreen> {
           role: 'assistant',
           content: finalReply,
           isStreaming: false,
+          ragMetadata: result.ragMetadata,
         );
         _loading = false;
         _waitingForStream = false;
