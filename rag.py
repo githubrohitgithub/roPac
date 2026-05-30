@@ -5,6 +5,13 @@ FAISS is used for attachment chunk retrieval when available.  The
 faiss_index module wraps every FAISS call in try/except so a missing
 or broken faiss-cpu installation falls back transparently to the
 original O(N) cosine similarity loop — no change in behaviour.
+
+Conflict handling:
+  Level 1 — Source priority labels + conflict rule injected into the LLM
+             prompt when multiple sources are present (format_rag_for_prompt).
+  Level 2 — Cross-chunk deduplication and inline conflict annotations
+             applied to every hit list before it reaches the LLM
+             (_deduplicate_hits, _detect_conflicts).
 """
 
 from __future__ import annotations
@@ -52,6 +59,14 @@ def load_rag_config() -> dict[str, Any]:
         # FAISS: use IndexFlatIP for attachment chunk retrieval when available.
         # Set false to always use the brute-force cosine loop (pure Python).
         "rag_use_faiss": True,
+        # Conflict handling thresholds.
+        # Chunks with similarity >= rag_dedup_sim_threshold are near-duplicates
+        # (only the higher-scored copy is kept in the prompt).
+        "rag_dedup_sim_threshold": 0.92,
+        # Chunks from *different* files with similarity in [low, high) are flagged
+        # as potential conflicts and annotated with an inline warning.
+        "rag_conflict_sim_low": 0.75,
+        "rag_conflict_sim_high": 0.92,
     }
     return {**defaults, **{k: cfg[k] for k in cfg}}
 
@@ -75,6 +90,141 @@ class RagHit:
     source: str
     text: str
     chunk_index: int
+    # Populated by _detect_conflicts — label of the conflicting source, if any
+    conflict_with: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Level 2 helpers: deduplication + conflict detection
+# ---------------------------------------------------------------------------
+
+
+def _cosine_similarity_vecs(a: list[float], b: list[float]) -> float:
+    """
+    Pure-Python cosine similarity between two pre-embedded vectors.
+    Used for cross-chunk comparison without an Ollama round-trip.
+    Returns 0.0 if vectors are empty or mismatched.
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(y * y for y in b))
+    if mag_a == 0.0 or mag_b == 0.0:
+        return 0.0
+    return dot / (mag_a * mag_b)
+
+
+def _source_file_label(source: str) -> str:
+    """Extract the bare filename from a source label like 'report.pdf — attachment'."""
+    return source.split(" — ")[0].strip()
+
+
+def _deduplicate_hits(
+    hits: list[RagHit],
+    vectors: dict[int, list[float]] | None = None,
+    *,
+    sim_threshold: float = 0.92,
+) -> list[RagHit]:
+    """
+    Remove near-duplicate chunks across any source.
+
+    Two hits are considered duplicates when their cosine similarity
+    exceeds `sim_threshold` (default 0.92 — near-identical wording).
+    When duplicates are found, only the higher-scored hit is kept.
+
+    If `vectors` (chunk_index -> embedding) is not provided, falls back
+    to a fast character-level token-overlap heuristic that requires no
+    embeddings at all.
+    """
+    if len(hits) <= 1:
+        return hits
+
+    kept: list[RagHit] = []
+    dropped: set[int] = set()  # indices into `hits`
+
+    for i, hi in enumerate(hits):
+        if i in dropped:
+            continue
+        for j, hj in enumerate(hits):
+            if j <= i or j in dropped:
+                continue
+            sim = 0.0
+            if vectors and hi.chunk_index in vectors and hj.chunk_index in vectors:
+                sim = _cosine_similarity_vecs(
+                    vectors[hi.chunk_index], vectors[hj.chunk_index]
+                )
+            else:
+                # Character-level overlap heuristic (fast, no embeddings)
+                set_i = set(hi.text.lower().split())
+                set_j = set(hj.text.lower().split())
+                union = set_i | set_j
+                if union:
+                    sim = len(set_i & set_j) / len(union)
+
+            if sim >= sim_threshold:
+                # Keep the higher-scored hit; drop the other
+                if hi.score >= hj.score:
+                    dropped.add(j)
+                else:
+                    dropped.add(i)
+                    break  # hi is dropped; skip checking its other pairs
+        if i not in dropped:
+            kept.append(hi)
+
+    return kept
+
+
+def _detect_conflicts(
+    hits: list[RagHit],
+    vectors: dict[int, list[float]] | None = None,
+    *,
+    low: float = 0.75,
+    high: float = 0.92,
+) -> list[RagHit]:
+    """
+    Flag cross-source near-matches as potential conflicts.
+
+    When two chunks from *different source files* have cosine similarity
+    in the range [low, high) they cover the same topic but may state
+    different facts.  The lower-ranked hit gets `conflict_with` set to
+    the filename of the higher-ranked counterpart so the formatter can
+    add an inline warning.
+
+    Chunks from the *same* file are never flagged (same file cannot
+    conflict with itself).
+    """
+    if len(hits) <= 1:
+        return hits
+
+    for i, hi in enumerate(hits):
+        for j, hj in enumerate(hits):
+            if j <= i:
+                continue
+            # Only flag cross-file pairs
+            if _source_file_label(hi.source) == _source_file_label(hj.source):
+                continue
+            sim = 0.0
+            if vectors and hi.chunk_index in vectors and hj.chunk_index in vectors:
+                sim = _cosine_similarity_vecs(
+                    vectors[hi.chunk_index], vectors[hj.chunk_index]
+                )
+            else:
+                set_i = set(hi.text.lower().split())
+                set_j = set(hj.text.lower().split())
+                union = set_i | set_j
+                if union:
+                    sim = len(set_i & set_j) / len(union)
+
+            if low <= sim < high:
+                # Tag the lower-ranked chunk as the conflicting one
+                loser = hj if hi.score >= hj.score else hi
+                winner = hi if hi.score >= hj.score else hj
+                if not loser.conflict_with:
+                    loser.conflict_with = _source_file_label(winner.source)
+
+    return hits
 
 
 def _format_hits(
@@ -84,13 +234,38 @@ def _format_hits(
     min_score: float,
     max_chars: int,
     cite_chunks: bool,
+    vectors: dict[int, list[float]] | None = None,
+    dedup_threshold: float = 0.92,
+    conflict_low: float = 0.75,
+    conflict_high: float = 0.92,
 ) -> str:
+    """
+    Deduplicate, detect conflicts, then format the top-k hits.
+
+    `vectors` is an optional mapping of chunk_index -> embedding vector
+    used for cosine-based dedup/conflict detection.  When absent a
+    fast token-overlap heuristic is used instead.
+    """
+    # --- Level 2a: remove near-identical duplicates ---
+    hits = _deduplicate_hits(hits, vectors, sim_threshold=dedup_threshold)
+
+    # --- Level 2b: annotate cross-source topic conflicts ---
+    hits = _detect_conflicts(hits, vectors, low=conflict_low, high=conflict_high)
+
+    # --- Format with optional conflict warnings inline ---
     from knowledge import _format_context
 
-    scored = [
-        (h.score, h.source, h.text, h.chunk_index)
-        for h in hits
-    ]
+    scored = []
+    for h in hits:
+        text = h.text
+        if h.conflict_with:
+            text = (
+                f"⚠️ [CONFLICT: This chunk from '{_source_file_label(h.source)}' "
+                f"covers the same topic as '{h.conflict_with}' but may state "
+                f"different facts. Prefer the higher-priority source.]\n{text}"
+            )
+        scored.append((h.score, h.source, text, h.chunk_index))
+
     return _format_context(
         scored,
         top_k,
@@ -469,12 +644,20 @@ def retrieve_attachment_context(
 
     min_cos = _rag_float(cfg, "rag_min_cosine_similarity", 0.28)
     char_limit = max_chars if max_chars is not None else 6000
+    # Build chunk_index -> vector map for cosine-based dedup/conflict detection
+    vec_map: dict[int, list[float]] | None = None
+    if vectors and len(vectors) == len(chunks):
+        vec_map = {i: vectors[i] for i in range(len(vectors))}
     return _format_hits(
         hits,
         k,
         min_score=min_cos,
         max_chars=char_limit,
         cite_chunks=cite,
+        vectors=vec_map,
+        dedup_threshold=_rag_float(cfg, "rag_dedup_sim_threshold", 0.92),
+        conflict_low=_rag_float(cfg, "rag_conflict_sim_low", 0.75),
+        conflict_high=_rag_float(cfg, "rag_conflict_sim_high", 0.92),
     )
 
 
@@ -646,12 +829,20 @@ def retrieve_attachment_hybrid(
         picked.add(hit.chunk_index)
 
     selected.sort(key=lambda h: h.score, reverse=True)
+    # Build chunk_index -> vector map for cosine-based dedup/conflict detection
+    vec_map: dict[int, list[float]] | None = None
+    if vectors and len(vectors) == len(chunks):
+        vec_map = {i: vectors[i] for i in range(len(vectors))}
     return _format_hits(
         selected,
         len(selected),
         min_score=0.0,
         max_chars=char_limit,
         cite_chunks=cite,
+        vectors=vec_map,
+        dedup_threshold=_rag_float(cfg, "rag_dedup_sim_threshold", 0.92),
+        conflict_low=_rag_float(cfg, "rag_conflict_sim_low", 0.75),
+        conflict_high=_rag_float(cfg, "rag_conflict_sim_high", 0.92),
     )
 
 
@@ -720,12 +911,20 @@ def retrieve_attachment_query_budget(
             hits.append(RagHit(kw, f"{label} — attachment", ch, i))
 
     hits.sort(key=lambda h: h.score, reverse=True)
+    # Build chunk_index -> vector map for cosine-based dedup/conflict detection
+    vec_map_q: dict[int, list[float]] | None = None
+    if vectors and len(vectors) == len(chunks):
+        vec_map_q = {i: vectors[i] for i in range(len(vectors))}
     return _format_hits(
         hits,
         len(hits),
         min_score=0.0,
         max_chars=char_limit,
         cite_chunks=cite,
+        vectors=vec_map_q,
+        dedup_threshold=_rag_float(cfg, "rag_dedup_sim_threshold", 0.92),
+        conflict_low=_rag_float(cfg, "rag_conflict_sim_low", 0.75),
+        conflict_high=_rag_float(cfg, "rag_conflict_sim_high", 0.92),
     )
 
 
@@ -883,25 +1082,39 @@ def format_rag_for_prompt(sections: dict[str, str]) -> str:
     parts: list[str] = []
     if sections.get("memory"):
         parts.append(
-            "OWNER MEMORY (retrieved for this question — about the machine owner, "
-            "not necessarily the person chatting):\n"
+            "OWNER MEMORY [Priority: Low — long-term personal facts, may be outdated]:\n"
             + sections["memory"]
         )
     if sections.get("documents"):
         parts.append(
-            "TRAINED DOCUMENTS (retrieved — prefer for document questions):\n"
+            "TRAINED DOCUMENTS [Priority: Medium — use for document-specific questions]:\n"
             + sections["documents"]
         )
     if sections.get("attachments"):
         parts.append(
-            "ATTACHED FILES (retrieved for this message — session only):\n"
+            "ATTACHED FILES [Priority: High — most current source, prefer over others]:\n"
             + sections["attachments"]
         )
 
+    # Build conflict notice when multiple sources are present
+    source_count = len([s for s in ("memory", "documents", "attachments") if sections.get(s)])
+    conflict_instruction = ""
+    if source_count > 1:
+        conflict_instruction = (
+            "\n⚠ CONFLICT RULE: If the sources above give different answers to the same "
+            "question, prefer the higher-priority source (Attached Files > Trained Documents "
+            "> Owner Memory). Always explicitly mention the discrepancy to the user, e.g.: "
+            "\"Note: [file A] says X, but [file B] says Y — the attached file takes priority.\""
+            "\n"
+        )
+
     header = (
-        "RETRIEVED KNOWLEDGE (RAG — use when relevant; cite bracketed source labels):\n\n"
+        "RETRIEVED KNOWLEDGE (RAG — use when relevant; cite bracketed source labels):\n"
+        + conflict_instruction
+        + "\n"
     )
     return header + "\n\n".join(parts)
+
 
 
 def owner_profile_preamble() -> str:
